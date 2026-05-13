@@ -5,7 +5,7 @@ import parameters._
 import L1Cache.MyConfig
 import L1Cache.ICache.{InstructionCache, ICacheMemReq_p, ICacheMemRsp, ICacheBundle}
 import pipeline.{CTAreqData, CTArspData, CTA2warp, pipe}
-import pipeline.{ICachePipeReq_np, ICachePipeRsp_np, DCacheCoreReq_np, DCacheCoreRsp_np}
+import pipeline.{ICachePipeReq_np, ICachePipeRsp_np, DCacheCoreReq_np, DCacheCoreRsp_np, ShareMemCoreReq_np}
 import pipeline.{InstClassPerfCounters, PipelinePerfCounters}
 import L1Cache.ShareMem.SharedMemory
 import chisel3.experimental.hierarchy.{Definition, Instance, instantiable, public, Instantiate}
@@ -16,6 +16,12 @@ import mmu.L1TlbAutoReflect
 class SMIO_icache(SV: Option[mmu.SVParam] = None)(implicit p: Parameters) extends ICacheBundle {
   val req = DecoupledIO(new ICacheMemReq_p(SV.getOrElse(mmu.SV32)))
   val rsp = Flipped(DecoupledIO(new ICacheMemRsp()))
+}
+
+class NoCacheDcacheRspRoute extends Bundle {
+  val isDma = Bool()
+  val dmaSource = UInt(l1cache_sourceBits.W)
+  val dmaAddr = UInt(xLen.W)
 }
 
 @instantiable
@@ -56,19 +62,28 @@ class SM_wrapper_nocache() extends Module {
   pipe.io.wg_id_tag:=cta2warp.io.wg_id_tag
 
   val sharedmem = Module(new SharedMemory()(param))
-  sharedmem.io.coreReq.bits.data:=pipe.io.shared_req.bits.data
-  sharedmem.io.coreReq.bits.instrId:=pipe.io.shared_req.bits.instrId
-  sharedmem.io.coreReq.bits.isWrite:=pipe.io.shared_req.bits.isWrite
-  sharedmem.io.coreReq.bits.setIdx:=pipe.io.shared_req.bits.setIdx
-  sharedmem.io.coreReq.bits.perLaneAddr:=pipe.io.shared_req.bits.perLaneAddr
-  sharedmem.io.coreReq.bits.sourceTag:=false.B // No DMA in nocache variant
-  sharedmem.io.coreReq.valid:=pipe.io.shared_req.valid
-  pipe.io.shared_req.ready:=sharedmem.io.coreReq.ready
-  sharedmem.io.coreRsp.ready:=pipe.io.shared_rsp.ready
-  pipe.io.shared_rsp.valid:=sharedmem.io.coreRsp.valid
-  pipe.io.shared_rsp.bits.data:=sharedmem.io.coreRsp.bits.data
-  pipe.io.shared_rsp.bits.instrId:=sharedmem.io.coreRsp.bits.instrId
-  pipe.io.shared_rsp.bits.activeMask:=sharedmem.io.coreRsp.bits.activeMask
+  val sharedReqArb = Module(new Arbiter(new ShareMemCoreReq_np, 2))
+  sharedReqArb.io.in(0) <> pipe.io.shared_req
+  sharedReqArb.io.in(1) <> pipe.io.dma_shared_req
+  sharedmem.io.coreReq.bits.data := sharedReqArb.io.out.bits.data
+  sharedmem.io.coreReq.bits.instrId := sharedReqArb.io.out.bits.instrId
+  sharedmem.io.coreReq.bits.isWrite := sharedReqArb.io.out.bits.isWrite
+  sharedmem.io.coreReq.bits.setIdx := sharedReqArb.io.out.bits.setIdx
+  sharedmem.io.coreReq.bits.perLaneAddr := sharedReqArb.io.out.bits.perLaneAddr
+  sharedmem.io.coreReq.bits.sourceTag := sharedReqArb.io.chosen === 1.U
+  sharedmem.io.coreReq.valid := sharedReqArb.io.out.valid
+  sharedReqArb.io.out.ready := sharedmem.io.coreReq.ready
+
+  val sharedRspFromDma = sharedmem.io.coreRsp.bits.sourceTag
+  pipe.io.shared_rsp.valid := sharedmem.io.coreRsp.valid && !sharedRspFromDma
+  pipe.io.shared_rsp.bits.data := sharedmem.io.coreRsp.bits.data
+  pipe.io.shared_rsp.bits.instrId := sharedmem.io.coreRsp.bits.instrId
+  pipe.io.shared_rsp.bits.activeMask := sharedmem.io.coreRsp.bits.activeMask
+  pipe.io.dma_shared_rsp.valid := sharedmem.io.coreRsp.valid && sharedRspFromDma
+  pipe.io.dma_shared_rsp.bits.data := sharedmem.io.coreRsp.bits.data
+  pipe.io.dma_shared_rsp.bits.instrId := sharedmem.io.coreRsp.bits.instrId
+  pipe.io.dma_shared_rsp.bits.activeMask := sharedmem.io.coreRsp.bits.activeMask
+  sharedmem.io.coreRsp.ready := Mux(sharedRspFromDma, pipe.io.dma_shared_rsp.ready, pipe.io.shared_rsp.ready)
 
   val icache = Module(new InstructionCache()(param))
   icache.io.invalidate := io.icache_invalidate
@@ -93,8 +108,56 @@ class SM_wrapper_nocache() extends Module {
 
   io.icache.req :<>= icache.io.memReq
   icache.io.memRsp :<>= io.icache.rsp
-  io.dcache_req :<>= pipe.io.dcache_req
-  pipe.io.dcache_rsp :<>= io.dcache_rsp
+  val dmaDcacheReq = Wire(DecoupledIO(new DCacheCoreReq_np))
+  val dmaLineAddr = pipe.io.dma_cache_req.bits.a_addr.get
+  val dmaBlockByteBits = log2Ceil(dcache_BlockWords * BytesOfWord)
+  dmaDcacheReq.valid := pipe.io.dma_cache_req.valid
+  pipe.io.dma_cache_req.ready := dmaDcacheReq.ready
+  dmaDcacheReq.bits.instrId := 0.U
+  dmaDcacheReq.bits.tag := dmaLineAddr(xLen - 1, dmaBlockByteBits + dcache_SetIdxBits)
+  dmaDcacheReq.bits.setIdx := dmaLineAddr(dmaBlockByteBits + dcache_SetIdxBits - 1, dmaBlockByteBits)
+  dmaDcacheReq.bits.asid.foreach(_ := 0.U)
+  dmaDcacheReq.bits.opcode := Mux(
+    pipe.io.dma_cache_req.bits.a_opcode === 4.U,
+    0.U,
+    Mux(pipe.io.dma_cache_req.bits.a_opcode === 0.U || pipe.io.dma_cache_req.bits.a_opcode === 1.U, 1.U, 3.U)
+  )
+  dmaDcacheReq.bits.param := pipe.io.dma_cache_req.bits.a_param.pad(4)
+  dmaDcacheReq.bits.spike_info.foreach(_ := DontCare)
+  (0 until num_thread).foreach { i =>
+    dmaDcacheReq.bits.perLaneAddr(i).activeMask := pipe.io.dma_cache_req.bits.a_mask(i).orR
+    dmaDcacheReq.bits.perLaneAddr(i).blockOffset := i.U
+    dmaDcacheReq.bits.perLaneAddr(i).wordOffset1H := pipe.io.dma_cache_req.bits.a_mask(i)
+    dmaDcacheReq.bits.data(i) := pipe.io.dma_cache_req.bits.a_data(i)
+  }
+
+  val dcacheReqArb = Module(new Arbiter(new DCacheCoreReq_np, 2))
+  dcacheReqArb.io.in(0) <> pipe.io.dcache_req
+  dcacheReqArb.io.in(1) <> dmaDcacheReq
+
+  val dcacheRspRouteQ = Module(new Queue(new NoCacheDcacheRspRoute, entries = 16))
+  val dcacheReqWillRsp = dcacheReqArb.io.out.bits.opcode =/= 3.U
+  val dcacheRouteReady = !dcacheReqWillRsp || dcacheRspRouteQ.io.enq.ready
+  io.dcache_req.valid := dcacheReqArb.io.out.valid && dcacheRouteReady
+  io.dcache_req.bits := dcacheReqArb.io.out.bits
+  dcacheReqArb.io.out.ready := io.dcache_req.ready && dcacheRouteReady
+  dcacheRspRouteQ.io.enq.valid := io.dcache_req.fire && dcacheReqWillRsp
+  dcacheRspRouteQ.io.enq.bits.isDma := dcacheReqArb.io.chosen === 1.U
+  dcacheRspRouteQ.io.enq.bits.dmaSource := pipe.io.dma_cache_req.bits.a_source
+  dcacheRspRouteQ.io.enq.bits.dmaAddr := dmaLineAddr
+
+  val dcacheRspRouteValid = dcacheRspRouteQ.io.deq.valid
+  val dcacheRspFromDma = dcacheRspRouteQ.io.deq.bits.isDma
+  pipe.io.dcache_rsp.valid := io.dcache_rsp.valid && dcacheRspRouteValid && !dcacheRspFromDma
+  pipe.io.dcache_rsp.bits := io.dcache_rsp.bits
+  pipe.io.dma_cache_rsp.valid := io.dcache_rsp.valid && dcacheRspRouteValid && dcacheRspFromDma
+  pipe.io.dma_cache_rsp.bits.d_opcode := 1.U
+  pipe.io.dma_cache_rsp.bits.d_param := 0.U
+  pipe.io.dma_cache_rsp.bits.d_source := dcacheRspRouteQ.io.deq.bits.dmaSource
+  pipe.io.dma_cache_rsp.bits.d_addr := dcacheRspRouteQ.io.deq.bits.dmaAddr
+  pipe.io.dma_cache_rsp.bits.d_data := io.dcache_rsp.bits.data
+  io.dcache_rsp.ready := dcacheRspRouteValid && Mux(dcacheRspFromDma, pipe.io.dma_cache_rsp.ready, pipe.io.dcache_rsp.ready)
+  dcacheRspRouteQ.io.deq.ready := io.dcache_rsp.fire
 
   if(GVM_ENABLED){
     val WF_ID_WIDTH = log2Ceil(num_warp_in_a_block)
@@ -118,15 +181,6 @@ class SM_wrapper_nocache() extends Module {
     gvm_cta2warp.io.rtl_num_thread := cta2warp.io.warpReq.bits.CTAdata.dispatch2cu_wf_size_dispatch.pad(32)
   }
 
-  // DMA ports: tie off for nocache variant (no L2 arbiter in this config)
-  // DMA L2 cache requests are sunk; L2 responses never arrive.
-  pipe.io.dma_cache_req.ready := false.B
-  pipe.io.dma_cache_rsp.valid := false.B
-  pipe.io.dma_cache_rsp.bits := DontCare
-  // DMA shared memory requests are sunk.
-  pipe.io.dma_shared_req.ready := false.B
-  pipe.io.dma_shared_rsp.valid := false.B
-  pipe.io.dma_shared_rsp.bits := DontCare
   // fence_end_dma: consumed inside pipe by warp scheduler; sink for observability.
   pipe.io.fence_end_dma.ready := true.B
   // DMA TLB: identity-mapping bypass (nocache variant has no L1 TLB)
@@ -142,11 +196,6 @@ class SM_wrapper_nocache() extends Module {
   pipe.io.dma_tlb_req.ready      := !dma_tlb_state
   pipe.io.dma_tlb_rsp.valid      := dma_tlb_state
   pipe.io.dma_tlb_rsp.bits.paddr := dma_tlb_paddr
-  // Deadlock detection: DMA instructions should never reach pipe in nocache builds.
-  when(!reset.asBool) {
-    assert(!pipe.io.dma_cache_req.valid,
-      "DMA L2 request reached nocache build - DMA instructions not supported in this configuration")
-  }
 }
 
 class GPGPU_top_nocache() extends Module {
