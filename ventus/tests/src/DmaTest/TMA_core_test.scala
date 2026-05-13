@@ -1000,4 +1000,246 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
       }
     }
   }
+
+  def descriptorControl(dataType: Int, rank: Int, interleave: Int = 0,
+      swizzle: Int = 0, l2promotion: Int = 0, oobfill: Int = 0): BigInt =
+    BigInt(dataType & 0xf) |
+      (BigInt(rank & 0xf) << 4) |
+      (BigInt(interleave & 0x3) << 8) |
+      (BigInt(swizzle & 0x3) << 10) |
+      (BigInt(l2promotion & 0x3) << 12) |
+      (BigInt(oobfill & 0x1) << 14)
+
+  def descriptorWordsFor(cmd: TmaCmd, swizzle: Int = 0): Seq[BigInt] = {
+    val words = Array.fill[BigInt](32)(0)
+    val dw = TmaRefModel.datawidthFromType(cmd.dataType)
+    words(0) = BigInt("56544d41", 16) // "VTMA"
+    words(1) = descriptorControl(cmd.dataType, cmd.tensorRank, swizzle = swizzle, oobfill = cmd.oobfill)
+    words(2) = cmd.globalAddress
+    words(3) = 128
+    for (i <- 0 until 5) {
+      words(4 + i) = cmd.globalDim(i)
+      words(14 + i) = cmd.boxDim(i)
+      words(19 + i) = cmd.elementStrides(i)
+    }
+    words(9) = dw
+    for (i <- 1 until 5) {
+      words(9 + i) = cmd.globalStrides(i - 1)
+    }
+    words.toSeq
+  }
+
+  def coordWords(coords: Seq[Int]): Seq[BigInt] = {
+    val words = Array.fill[BigInt](32)(0)
+    for (i <- 0 until scala.math.min(5, coords.length)) words(i) = coords(i)
+    words.toSeq
+  }
+
+  def driveTmaDescCmd(
+      dut: DMA_core,
+      descPtr: Int,
+      dynPtr: Int,
+      dst: Int,
+      wid: Int
+  ): Unit = {
+    dut.io.dma_req.valid.poke(true.B)
+    for (i <- 0 until num_thread) {
+      dut.io.dma_req.bits.in1(i).poke((if (i == 0) descPtr else 0).U)
+      dut.io.dma_req.bits.in2(i).poke((if (i == 0) dynPtr else 0).U)
+      dut.io.dma_req.bits.in3(i).poke((if (i == 0) dst else 0).U)
+      dut.io.dma_req.bits.mask(i).poke(true.B)
+    }
+    pokeCtrlSigsZero(dut.io.dma_req.bits.ctrl)
+    pokeCtrlSpikeInfo(dut.io.dma_req.bits.ctrl)
+    dut.io.dma_req.bits.ctrl.dma.poke(true.B)
+    dut.io.dma_req.bits.ctrl.funct.poke(6.U)
+    dut.io.dma_req.bits.ctrl.wid.poke(wid.U)
+
+    var cycles = 0
+    while (!dut.io.dma_req.ready.peekBoolean() && cycles < 50) {
+      dut.clock.step()
+      cycles += 1
+    }
+    assert(dut.io.dma_req.ready.peekBoolean(), "descriptor dma_req should be ready")
+    dut.clock.step()
+    dut.io.dma_req.valid.poke(false.B)
+  }
+
+  def driveTmaPrefetch(dut: DMA_core, descPtr: Int, wid: Int): Unit = {
+    dut.io.dma_req.valid.poke(true.B)
+    for (i <- 0 until num_thread) {
+      dut.io.dma_req.bits.in1(i).poke((if (i == 0) descPtr else 0).U)
+      dut.io.dma_req.bits.in2(i).poke(0.U)
+      dut.io.dma_req.bits.in3(i).poke(0.U)
+      dut.io.dma_req.bits.mask(i).poke(true.B)
+    }
+    pokeCtrlSigsZero(dut.io.dma_req.bits.ctrl)
+    pokeCtrlSpikeInfo(dut.io.dma_req.bits.ctrl)
+    dut.io.dma_req.bits.ctrl.dma.poke(true.B)
+    dut.io.dma_req.bits.ctrl.funct.poke(5.U)
+    dut.io.dma_req.bits.ctrl.wid.poke(wid.U)
+
+    var cycles = 0
+    while (!dut.io.dma_req.ready.peekBoolean() && cycles < 50) {
+      dut.clock.step()
+      cycles += 1
+    }
+    assert(dut.io.dma_req.ready.peekBoolean(), "prefetch dma_req should be ready")
+    dut.clock.step()
+    dut.io.dma_req.valid.poke(false.B)
+  }
+
+  def pokeDmaRspWords(dut: DMA_core, source: BigInt, words: Seq[BigInt]): Unit = {
+    dut.io.dma_cache_rsp.valid.poke(true.B)
+    dut.io.dma_cache_rsp.bits.d_opcode.poke(1.U)
+    dut.io.dma_cache_rsp.bits.d_source.poke(source.U)
+    dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+    for (w <- 0 until dcache_BlockWords) {
+      dut.io.dma_cache_rsp.bits.d_data(w).poke(words(w).U)
+    }
+  }
+
+  def descriptorServiceUntilDone(
+      dut: DMA_core,
+      descPtr: Int,
+      dynPtr: Int,
+      descWords: Seq[BigInt],
+      dynWords: Seq[BigInt],
+      expectedDataL2Count: Int,
+      expectedFenceCount: Int,
+      tlb: TlbMockState = new TlbMockState()
+  ): (Seq[(BigInt, BigInt)], Seq[BigInt], Seq[SharedReqObs]) = {
+    val reqs = scala.collection.mutable.ArrayBuffer.empty[(BigInt, BigInt)]
+    val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+    val sharedReqObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
+    val descLine = descPtr & ~(L2CachelineBytes - 1)
+    val dynLine = dynPtr & ~(L2CachelineBytes - 1)
+    val expectedReqCount = expectedDataL2Count + (if (dynPtr == 0) 1 else 2)
+    var cycles = 0
+    val maxCycles = 3000
+
+    while ((reqs.length < expectedReqCount || fences.distinct.length < expectedFenceCount) && cycles < maxCycles) {
+      var progressed = false
+      mockTlbCycle(dut, fences, tlb)
+
+      if (dut.io.dma_cache_req.valid.peekBoolean()) {
+        val source = dut.io.dma_cache_req.bits.a_source.peekInt()
+        val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
+        reqs += ((source, addr))
+        val isMeta = (source & 1) == 1
+        val payload =
+          if (addr == descLine) {
+            assert(isMeta, "descriptor fetch should use metadata source")
+            descWords
+          } else if (dynPtr != 0 && addr == dynLine) {
+            assert(isMeta, "dynamic coords fetch should use metadata source")
+            dynWords
+          } else {
+            assert(!isMeta, s"data fetch should not use metadata source, addr=0x${addr.toString(16)}")
+            (0 until dcache_BlockWords).map(w => BigInt("d0000000", 16) + reqs.length * 0x100 + w * 4)
+          }
+
+        dut.clock.step()
+        pokeDmaRspWords(dut, source, payload)
+        var rspCycles = 0
+        while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < 60) {
+          stepAndSample(dut, fences)
+          rspCycles += 1
+        }
+        assert(dut.io.dma_cache_rsp.ready.peekBoolean(), "descriptor dma_cache_rsp should be ready")
+        stepAndSample(dut, fences)
+        dut.io.dma_cache_rsp.valid.poke(false.B)
+        sampleFence(dut, fences)
+        progressed = true
+      } else {
+        var keepDrainingShared = true
+        while (keepDrainingShared) {
+          collectSharedReq(dut, "descriptorService") match {
+            case Some(plan) =>
+              sharedReqObs += plan
+              sendSharedRsp(dut, plan, fences)
+              progressed = true
+            case None =>
+              keepDrainingShared = false
+          }
+        }
+      }
+
+      sampleFence(dut, fences)
+      if (!progressed) stepAndSample(dut, fences)
+      cycles += 1
+    }
+
+    assert(reqs.length == expectedReqCount,
+      s"Expected $expectedReqCount descriptor/data L2 requests, got ${reqs.length}")
+    assert(fences.distinct.length == expectedFenceCount,
+      s"Expected $expectedFenceCount fences, got ${fences.distinct.length} unique (${fences.mkString(",")})")
+    (reqs.toSeq, fences.distinct.toSeq, sharedReqObs.toSeq)
+  }
+
+  "TMA_T26_descriptor_g2s_fetches_descriptor_and_coords" in {
+    test(new DMA_core).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+      initDut(dut)
+      val coords = Seq(2, 2, 0, 0, 0)
+      val boxAddress = 0x90000 + coords(0) * 4 + coords(1) * 32
+      val cmd = TmaCmd(
+        name = "T26_descriptor_subbox",
+        wid = 4,
+        dataType = 6,
+        tensorRank = 2,
+        globalAddress = 0x90000,
+        globalDim = Seq(8, 8, 1, 1, 1),
+        globalStrides = Seq(32, 0, 0, 0, 0),
+        boxAddress = boxAddress,
+        boxDim = Seq(4, 4, 1, 1, 1),
+        elementStrides = Seq(1, 1, 1, 1, 1),
+        dst = 0x800
+      )
+      val descPtr = 0x20000
+      val dynPtr = 0x20100
+      val expectedDataReqs = TmaRefModel.computeExpectedL2Addrs(cmd)
+
+      driveTmaDescCmd(dut, descPtr, dynPtr, cmd.dst, cmd.wid)
+      val (reqs, fenceResult, sharedObs) = descriptorServiceUntilDone(
+        dut,
+        descPtr,
+        dynPtr,
+        descriptorWordsFor(cmd),
+        coordWords(coords),
+        expectedDataReqs.length,
+        1)
+
+      val reqAddrs = reqs.map(_._2.toInt)
+      val dataReqAddrs = reqs.drop(2).map(_._2.toInt)
+      assert(reqAddrs.take(2) == Seq(descPtr, dynPtr),
+        s"T26 metadata request order mismatch: got=${reqAddrs.take(2).map(a => f"0x$a%x")}")
+      assert(dataReqAddrs == expectedDataReqs,
+        s"T26 data request addrs mismatch:\n  got=${dataReqAddrs.map(a => f"0x$a%x")}\n  exp=${expectedDataReqs.map(a => f"0x$a%x")}")
+      assert(fenceResult.contains(BigInt(cmd.wid)), "T26 fence mismatch")
+      assert(sharedObs.nonEmpty, "T26 should issue shared memory writes")
+    }
+  }
+
+  "TMA_T27_prefetch_tensormap_drops_payload_and_completes" in {
+    test(new DMA_core).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+      initDut(dut)
+      val descPtr = 0x28000
+      val wid = 5
+      driveTmaPrefetch(dut, descPtr, wid)
+      val (reqs, fences, sharedObs) = descriptorServiceUntilDone(
+        dut,
+        descPtr,
+        0,
+        Seq.fill(32)(0),
+        Seq.fill(32)(0),
+        expectedDataL2Count = 0,
+        expectedFenceCount = 1)
+
+      assert(reqs.size == 1, "T27 should issue exactly one descriptor-line read")
+      assert((reqs.head._1 & 1) == 1, "T27 prefetch should use metadata source")
+      assert(reqs.head._2 == BigInt(descPtr), s"T27 prefetch addr mismatch: got=0x${reqs.head._2.toString(16)}")
+      assert(fences.contains(BigInt(wid)), "T27 prefetch completion should release DMA inflight")
+      assert(sharedObs.isEmpty, "T27 prefetch must not emit shared-memory writes")
+    }
+  }
 }

@@ -108,7 +108,7 @@ class DmaTempOutput extends Bundle {
 // ============================================================
 // AddrCalc_l2cache: decode DMA instruction, generate L2 requests
 // ============================================================
-class AddrCalc_l2cache extends Module {
+class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
     val from_fifo = Flipped(DecoupledIO(new vExeData))
     val to_tempmem_inst = DecoupledIO(new vExeDataDMA)
@@ -116,16 +116,32 @@ class AddrCalc_l2cache extends Module {
     val inst_mem_index = Input(UInt(log2Ceil(max_dma_inst).W))
     val tag_mem_index = Input(UInt(log2Ceil(max_dma_tag).W))
     val to_l2cache = DecoupledIO(new DCacheMemReq_p)
+    val from_l2cache_meta = Flipped(DecoupledIO(new DCacheMemRsp))
+    val meta_complete = DecoupledIO(UInt(depth_warp.W))
     val to_l2TLB = DecoupledIO(new L1TlbReq(SV32))
     val from_l2TLB = Flipped(DecoupledIO(new L1TlbRsp(SV32)))
   })
 
-  val s_idle :: s_tensor_setup :: s_save :: s_l2cache_tag :: s_tlb_req :: s_tlb_rsp :: s_l2cache :: Nil = Enum(7)
+  val (s_idle :: s_prefetch_tlb_req :: s_prefetch_tlb_rsp ::
+    s_prefetch_l2cache :: s_prefetch_rsp :: s_prefetch_done ::
+    s_desc_tlb_req :: s_desc_tlb_rsp :: s_desc_l2cache :: s_desc_rsp ::
+    s_dyn_tlb_req :: s_dyn_tlb_rsp :: s_dyn_l2cache :: s_dyn_rsp ::
+    s_tensor_setup :: s_save :: s_l2cache_tag :: s_tlb_req :: s_tlb_rsp ::
+    s_l2cache :: Nil) = Enum(20)
   val state = RegInit(s_idle)
   val reg_save = Reg(new DmaRegSave)
   val inst_mem_index_reg = RegInit(0.U(log2Up(max_dma_inst).W))
   val tag_mem_index_reg = RegInit(0.U(log2Ceil(max_dma_tag).W))
   val p_addr_reg = Reg(UInt(SV32.paLen.W))
+  val desc_ptr_reg = RegInit(0.U(xLen.W))
+  val dyn_ptr_reg = RegInit(0.U(xLen.W))
+  val meta_vaddr_reg = RegInit(0.U(xLen.W))
+  val desc_words_reg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
+  val dyn_words_reg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
+
+  val dmaSourceLowBits = l1cache_sourceBits - log2Ceil(max_dma_tag) - log2Ceil(max_dma_inst)
+  require(dmaSourceLowBits > 0, "DMA source encoding needs a spare low bit for metadata responses")
+  val dmaMetaSource = 1.U(l1cache_sourceBits.W)
 
   // ---- Tensor iteration state ----
   import DataType._
@@ -154,38 +170,78 @@ class AddrCalc_l2cache extends Module {
   (0 until 5).foreach(x => tensor_dim_offset_next(x) := tensor_dim_offset_reg(x))
   (0 until 5).foreach(x => tensor_shared_offset_next(x) := tensor_shared_offset_reg(x))
 
-  // ---- TensorVars extraction from reg_save ----
+  // ---- TensorVars extraction from legacy VGPRs or descriptor memory ----
   val tvars = Wire(new TensorVars)
-  tvars.BoxAddress := reg_save.in2(0)
-  (0 until 5).foreach { x =>
-    tvars.boxDim(x) := reg_save.in2(1 + x)
-    tvars.elementStrides(x) := reg_save.in2(6 + x)
-  }
-  tvars.interleaveMode := reg_save.in2(11)(log2Ceil(3) - 1, 0)
-  tvars.swizzleMode    := reg_save.in2(12)(log2Ceil(4) - 1, 0)
-  tvars.L2promotion    := reg_save.in2(13)(log2Ceil(4) - 1, 0)
-  tvars.oobfill        := reg_save.in2(14)(log2Ceil(2) - 1, 0)
-  tvars.dataType       := reg_save.in1(0)(log2Ceil(13) - 1, 0)
-  tvars.tensorRank     := reg_save.in1(1)(log2Ceil(5) - 1, 0)
-  tvars.globalAddress  := reg_save.in1(2)
-  (0 until 5).foreach { x =>
-    tvars.globalDim(x) := reg_save.in1(3 + x)
-    tvars.globalStrides(x) := reg_save.in1(8 + x)
-  }
-  // datawidth derived from dataType — encoding matches spike cp_async_tensor.h.
-
-  tvars.datawidth := Mux(
-    reg_save.in1(0) === UINT8 || reg_save.in1(0) === INT8, 1.U,
+  val desc_control = desc_words_reg(1)
+  def tensorDataWidth(dataType: UInt): UInt = Mux(
+    dataType === UINT8 || dataType === INT8, 1.U,
     Mux(
-      reg_save.in1(0) === UINT16 || reg_save.in1(0) === INT16 ||
-        reg_save.in1(0) === FLOAT16 || reg_save.in1(0) === BFLOAT16, 2.U,
+      dataType === UINT16 || dataType === INT16 ||
+        dataType === FLOAT16 || dataType === BFLOAT16, 2.U,
       Mux(
-        reg_save.in1(0) === UINT32 || reg_save.in1(0) === INT32 ||
-          reg_save.in1(0) === FLOAT32, 4.U,
+        dataType === UINT32 || dataType === INT32 ||
+          dataType === FLOAT32, 4.U,
         8.U  // UINT64 / INT64 / FLOAT64
       )
     )
   )
+  val desc_byte_stride = Wire(Vec(5, UInt(xLen.W)))
+  desc_byte_stride(0) := Mux(desc_words_reg(9) === 0.U, tensorDataWidth(desc_control(3, 0)), desc_words_reg(9))
+  (1 until 5).foreach { x => desc_byte_stride(x) := desc_words_reg(9 + x) }
+  val desc_coords = Wire(Vec(5, UInt(xLen.W)))
+  (0 until 5).foreach { x => desc_coords(x) := Mux(dyn_ptr_reg === 0.U, 0.U, dyn_words_reg(x)) }
+  val desc_box_address =
+    desc_words_reg(2) +
+      desc_coords(0) * desc_byte_stride(0) +
+      desc_coords(1) * desc_byte_stride(1) +
+      desc_coords(2) * desc_byte_stride(2) +
+      desc_coords(3) * desc_byte_stride(3) +
+      desc_coords(4) * desc_byte_stride(4)
+
+  val desc_mode = reg_save.ctrl.funct === 6.U
+  val tensor_copy_mode = (reg_save.ctrl.funct === 3.U) || desc_mode
+  when(desc_mode) {
+    tvars.BoxAddress := desc_box_address
+    (0 until 5).foreach { x =>
+      tvars.boxDim(x) := desc_words_reg(14 + x)
+      tvars.elementStrides(x) := Mux(desc_words_reg(19 + x) === 0.U, 1.U, desc_words_reg(19 + x))
+    }
+    tvars.interleaveMode := desc_control(9, 8)
+    tvars.swizzleMode    := desc_control(11, 10)
+    tvars.L2promotion    := desc_control(13, 12)
+    tvars.oobfill        := desc_control(14).asUInt
+    tvars.dataType       := desc_control(3, 0)
+    tvars.tensorRank     := desc_control(6, 4)
+    tvars.globalAddress  := desc_words_reg(2)
+    (0 until 5).foreach { x =>
+      tvars.globalDim(x) := desc_words_reg(4 + x)
+    }
+    tvars.globalStrides(0) := desc_byte_stride(1)
+    tvars.globalStrides(1) := desc_byte_stride(2)
+    tvars.globalStrides(2) := desc_byte_stride(3)
+    tvars.globalStrides(3) := desc_byte_stride(4)
+    tvars.globalStrides(4) := 0.U
+  }.otherwise {
+    tvars.BoxAddress := reg_save.in2(0)
+    (0 until 5).foreach { x =>
+      tvars.boxDim(x) := reg_save.in2(1 + x)
+      tvars.elementStrides(x) := reg_save.in2(6 + x)
+    }
+    tvars.interleaveMode := reg_save.in2(11)(log2Ceil(3) - 1, 0)
+    tvars.swizzleMode    := reg_save.in2(12)(log2Ceil(4) - 1, 0)
+    tvars.L2promotion    := reg_save.in2(13)(log2Ceil(4) - 1, 0)
+    tvars.oobfill        := reg_save.in2(14)(log2Ceil(2) - 1, 0)
+    tvars.dataType       := reg_save.in1(0)(log2Ceil(13) - 1, 0)
+    tvars.tensorRank     := reg_save.in1(1)(log2Ceil(5) - 1, 0)
+    tvars.globalAddress  := reg_save.in1(2)
+    (0 until 5).foreach { x =>
+      tvars.globalDim(x) := reg_save.in1(3 + x)
+      tvars.globalStrides(x) := reg_save.in1(8 + x)
+    }
+  }
+
+  // datawidth derived from dataType — encoding matches spike cp_async_tensor.h.
+  tvars.datawidth := tensorDataWidth(tvars.dataType)
 
   def alignToL2Line(addr: UInt): UInt =
     Cat(addr(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
@@ -348,7 +404,7 @@ class AddrCalc_l2cache extends Module {
   val tensor_row_has_next_line = (reg_save.address + l2cacheline.U) < box_dim0_end
   val address_next = Wire(UInt(xLen.W))
   address_next := reg_save.address + l2cacheline.U
-  when(reg_save.ctrl.funct === 3.U) {
+  when(tensor_copy_mode) {
     when(tensor_row_has_next_line) {
       address_next := reg_save.address + l2cacheline.U
     }.elsewhen(tensor_has_next_row) {
@@ -362,23 +418,24 @@ class AddrCalc_l2cache extends Module {
 
   // Complete when next cacheline >= src + srcsize (linear) or highest dim done (tensor)
   val complete_address = Wire(Bool())
-  complete_address := Mux(reg_save.ctrl.funct === 3.U,
+  complete_address := Mux(tensor_copy_mode,
     !tensor_row_has_next_line && !tensor_has_next_row,
     next_cacheline >= (reg_save.in1(0) + reg_save.in2(0)))
 
   // Temp inst store interface
   io.to_tempmem_inst.valid := state === s_save
-  io.to_tempmem_inst.bits.src := Mux(reg_save.ctrl.funct === 3.U, tvars.globalAddress, reg_save.in1(0))
-  io.to_tempmem_inst.bits.srcsize := Mux(reg_save.ctrl.funct === 3.U, tvars.datawidth, reg_save.in2(0))
+  io.to_tempmem_inst.bits.src := Mux(tensor_copy_mode, tvars.globalAddress, reg_save.in1(0))
+  io.to_tempmem_inst.bits.srcsize := Mux(tensor_copy_mode, tvars.datawidth, reg_save.in2(0))
   io.to_tempmem_inst.bits.dst := reg_save.in3(0)
   io.to_tempmem_inst.bits.wid := reg_save.ctrl.wid
-  io.to_tempmem_inst.bits.funct := reg_save.ctrl.funct
+  io.to_tempmem_inst.bits.funct := Mux(tensor_copy_mode, 3.U, reg_save.ctrl.funct)
   io.to_tempmem_inst.bits.tensorvars := tvars
   io.to_tempmem_inst.bits.copysize := 0.U
   switch(reg_save.ctrl.funct) {
     is(0.U) { io.to_tempmem_inst.bits.copysize := 4.U << reg_save.ctrl.copysize }
     is(1.U) { io.to_tempmem_inst.bits.copysize := reg_save.in2(0) }
     is(3.U) { io.to_tempmem_inst.bits.copysize := tensor_copy_size_reg }
+    is(6.U) { io.to_tempmem_inst.bits.copysize := tensor_copy_size_reg }
   }
 
   // Temp tag store interface
@@ -396,28 +453,44 @@ class AddrCalc_l2cache extends Module {
 
   // TLB request
   val aligned_vaddr = Cat(reg_save.address(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
-  io.to_l2TLB.valid := state === s_tlb_req
-  io.to_l2TLB.bits.vaddr := aligned_vaddr
+  val aligned_meta_vaddr = Cat(meta_vaddr_reg(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
+  val meta_tlb_req_state =
+    state === s_prefetch_tlb_req || state === s_desc_tlb_req || state === s_dyn_tlb_req
+  val meta_tlb_rsp_state =
+    state === s_prefetch_tlb_rsp || state === s_desc_tlb_rsp || state === s_dyn_tlb_rsp
+  val meta_l2cache_state =
+    state === s_prefetch_l2cache || state === s_desc_l2cache || state === s_dyn_l2cache
+  val meta_rsp_state =
+    state === s_prefetch_rsp || state === s_desc_rsp || state === s_dyn_rsp
+  io.to_l2TLB.valid := state === s_tlb_req || meta_tlb_req_state
+  io.to_l2TLB.bits.vaddr := Mux(meta_tlb_req_state, aligned_meta_vaddr, aligned_vaddr)
   io.to_l2TLB.bits.asid := reg_save.ctrl.asid.getOrElse(0.U)
 
   // TLB response
-  io.from_l2TLB.ready := state === s_tlb_rsp
+  io.from_l2TLB.ready := state === s_tlb_rsp || meta_tlb_rsp_state
 
   // L2 cache request — uses translated physical address
-  io.to_l2cache.valid := state === s_l2cache
+  io.to_l2cache.valid := state === s_l2cache || meta_l2cache_state
   io.to_l2cache.bits.a_opcode := 4.U // Get
-  io.to_l2cache.bits.a_source := Cat(tag_mem_index_reg, inst_mem_index_reg, 0.U((l1cache_sourceBits - log2Ceil(max_dma_tag) - log2Ceil(max_dma_inst)).W))
+  io.to_l2cache.bits.a_source := Mux(
+    meta_l2cache_state,
+    dmaMetaSource,
+    Cat(tag_mem_index_reg, inst_mem_index_reg, 0.U(dmaSourceLowBits.W))
+  )
   io.to_l2cache.bits.a_addr.foreach(_ := p_addr_reg)
   io.to_l2cache.bits.a_mask := VecInit(Seq.fill(dcache_BlockWords)(Fill(BytesOfWord, 1.U)))
   io.to_l2cache.bits.a_data := VecInit(Seq.fill(dcache_BlockWords)(0.U(xLen.W)))
   io.to_l2cache.bits.a_param := 0.U
   io.to_l2cache.bits.spike_info.foreach(_ := io.to_l2cache.bits.defaultSpikeInfo)
+  io.from_l2cache_meta.ready := meta_rsp_state
+  io.meta_complete.valid := state === s_prefetch_done
+  io.meta_complete.bits := reg_save.ctrl.wid
 
   io.from_fifo.ready := state === s_idle
 
   // TLB timeout watchdog
   val tlb_wait_cnt = RegInit(0.U(16.W))
-  when(state === s_tlb_req || state === s_tlb_rsp) {
+  when(state === s_tlb_req || state === s_tlb_rsp || meta_tlb_req_state || meta_tlb_rsp_state) {
     tlb_wait_cnt := tlb_wait_cnt + 1.U
   }.otherwise {
     tlb_wait_cnt := 0.U
@@ -427,9 +500,10 @@ class AddrCalc_l2cache extends Module {
   }
 
   // TLB page offset consistency assertion
-  when(!reset.asBool && state === s_tlb_rsp && io.from_l2TLB.fire) {
+  when(!reset.asBool && (state === s_tlb_rsp || meta_tlb_rsp_state) && io.from_l2TLB.fire) {
+    val tlb_check_vaddr = Mux(meta_tlb_rsp_state, aligned_meta_vaddr, reg_save.address)
     assert(io.from_l2TLB.bits.paddr(SV32.offsetLen - 1, 0) ===
-           reg_save.address(SV32.offsetLen - 1, 0),
+           tlb_check_vaddr(SV32.offsetLen - 1, 0),
       "TLB paddr page offset mismatch with vaddr")
   }
 
@@ -437,8 +511,70 @@ class AddrCalc_l2cache extends Module {
   switch(state) {
     is(s_idle) {
       when(io.from_fifo.fire) {
-        state := Mux(io.from_fifo.bits.ctrl.funct === 3.U, s_tensor_setup, s_save)
+        when(io.from_fifo.bits.ctrl.funct === 5.U) {
+          state := s_prefetch_tlb_req
+        }.elsewhen(io.from_fifo.bits.ctrl.funct === 6.U) {
+          state := s_desc_tlb_req
+        }.elsewhen(io.from_fifo.bits.ctrl.funct === 3.U) {
+          state := s_tensor_setup
+        }.otherwise {
+          state := s_save
+        }
       }
+    }
+    is(s_prefetch_tlb_req) {
+      when(io.to_l2TLB.fire) { state := s_prefetch_tlb_rsp }
+    }
+    is(s_prefetch_tlb_rsp) {
+      when(io.from_l2TLB.fire) {
+        p_addr_reg := io.from_l2TLB.bits.paddr
+        state := s_prefetch_l2cache
+      }
+    }
+    is(s_prefetch_l2cache) {
+      when(io.to_l2cache.fire) { state := s_prefetch_rsp }
+    }
+    is(s_prefetch_rsp) {
+      when(io.from_l2cache_meta.fire) { state := s_prefetch_done }
+    }
+    is(s_prefetch_done) {
+      when(io.meta_complete.fire) { state := s_idle }
+    }
+    is(s_desc_tlb_req) {
+      when(io.to_l2TLB.fire) { state := s_desc_tlb_rsp }
+    }
+    is(s_desc_tlb_rsp) {
+      when(io.from_l2TLB.fire) {
+        p_addr_reg := io.from_l2TLB.bits.paddr
+        state := s_desc_l2cache
+      }
+    }
+    is(s_desc_l2cache) {
+      when(io.to_l2cache.fire) { state := s_desc_rsp }
+    }
+    is(s_desc_rsp) {
+      when(io.from_l2cache_meta.fire) {
+        when(dyn_ptr_reg === 0.U) {
+          state := s_tensor_setup
+        }.otherwise {
+          state := s_dyn_tlb_req
+        }
+      }
+    }
+    is(s_dyn_tlb_req) {
+      when(io.to_l2TLB.fire) { state := s_dyn_tlb_rsp }
+    }
+    is(s_dyn_tlb_rsp) {
+      when(io.from_l2TLB.fire) {
+        p_addr_reg := io.from_l2TLB.bits.paddr
+        state := s_dyn_l2cache
+      }
+    }
+    is(s_dyn_l2cache) {
+      when(io.to_l2cache.fire) { state := s_dyn_rsp }
+    }
+    is(s_dyn_rsp) {
+      when(io.from_l2cache_meta.fire) { state := s_tensor_setup }
     }
     is(s_tensor_setup) {
       state := s_save
@@ -473,17 +609,40 @@ class AddrCalc_l2cache extends Module {
         reg_save.in1 := io.from_fifo.bits.in1
         reg_save.in2 := io.from_fifo.bits.in2
         reg_save.in3 := io.from_fifo.bits.in3
-        // Tensor: initial address from BoxAddress (in2(0)); linear: from src (in1(0))
+        desc_ptr_reg := io.from_fifo.bits.in1(0)
+        dyn_ptr_reg := io.from_fifo.bits.in2(0)
+        meta_vaddr_reg := io.from_fifo.bits.in1(0)
+        // Legacy tensor: initial address from BoxAddress (in2(0)); linear: from src (in1(0)).
+        // Descriptor tensor fills the real BoxAddress after its descriptor/dynamic fetch.
         reg_save.address := Mux(io.from_fifo.bits.ctrl.funct === 3.U,
           Cat(io.from_fifo.bits.in2(0)(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W)),
           Cat(io.from_fifo.bits.in1(0)(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W)))
         reg_save.ctrl := io.from_fifo.bits.ctrl
       }
     }
+    is(s_desc_rsp) {
+      when(io.from_l2cache_meta.fire) {
+        desc_words_reg := io.from_l2cache_meta.bits.d_data
+        when(dyn_ptr_reg === 0.U) {
+          dyn_words_reg := VecInit(Seq.fill(32)(0.U(xLen.W)))
+        }.otherwise {
+          meta_vaddr_reg := dyn_ptr_reg
+        }
+      }
+    }
+    is(s_dyn_rsp) {
+      when(io.from_l2cache_meta.fire) {
+        dyn_words_reg := io.from_l2cache_meta.bits.d_data
+      }
+    }
     is(s_tensor_setup) {
-      when(!reset.asBool && reg_save.ctrl.funct === 3.U) {
+      when(!reset.asBool && tensor_copy_mode) {
         assert(tvars.interleaveMode === 0.U,
           "DMA TMA interleaveMode is not supported in RTL")
+        when(desc_mode) {
+          assert(desc_ptr_reg(log2Ceil(l2cacheline) - 1, 0) === 0.U,
+            "DMA descriptor TMA requires 128B-aligned descriptor in v0")
+        }
       }
       (0 until 5).foreach { x =>
         tensor_dim_step_reg(x) := 0.U
@@ -520,7 +679,7 @@ class AddrCalc_l2cache extends Module {
     is(s_l2cache) {
       when(io.to_l2cache.fire) {
         reg_save.address := address_next
-        when(reg_save.ctrl.funct === 3.U) {
+        when(tensor_copy_mode) {
           when(!tensor_row_has_next_line) {
             (0 until 5).foreach { x =>
               tensor_dim_step_reg(x) := tensor_dim_step_next(x)
@@ -1069,9 +1228,19 @@ class DMA_core(implicit p: Parameters) extends Module {
   tempmem.io.from_addr_tag <> addrCalc_l2cache.io.to_tempmem_tag
   addrCalc_l2cache.io.inst_mem_index := tempmem.io.inst_mem_index
   addrCalc_l2cache.io.tag_mem_index := tempmem.io.tag_mem_index
-  tempmem.io.from_l2cache <> io.dma_cache_rsp
+  val dma_rsp_is_meta = io.dma_cache_rsp.bits.d_source(0)
+  addrCalc_l2cache.io.from_l2cache_meta.valid := io.dma_cache_rsp.valid && dma_rsp_is_meta
+  addrCalc_l2cache.io.from_l2cache_meta.bits := io.dma_cache_rsp.bits
+  tempmem.io.from_l2cache.valid := io.dma_cache_rsp.valid && !dma_rsp_is_meta
+  tempmem.io.from_l2cache.bits := io.dma_cache_rsp.bits
+  io.dma_cache_rsp.ready := Mux(dma_rsp_is_meta,
+    addrCalc_l2cache.io.from_l2cache_meta.ready,
+    tempmem.io.from_l2cache.ready)
   tempmem.io.from_shared <> io.shared_rsp
-  io.fence_end_dma <> tempmem.io.inst_complete
+  val dmaCompleteArb = Module(new Arbiter(UInt(depth_warp.W), 2))
+  dmaCompleteArb.io.in(0) <> tempmem.io.inst_complete
+  dmaCompleteArb.io.in(1) <> addrCalc_l2cache.io.meta_complete
+  io.fence_end_dma <> dmaCompleteArb.io.out
 
   // Address calculator -> shared memory
   val addrCalc_shared = Module(new Addrcalc_shared)
