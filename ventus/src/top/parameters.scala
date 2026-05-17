@@ -150,6 +150,8 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
   def max_dma_inst = if(num_warp >= 4) num_warp else 4  // max DMA instructions in flight
   def max_dma_tag = 8
   def max_l2cacheline = 6
+  def tma_desc_cache_entries = 2
+  def tma_prefetch_slots = 2
   def dma_data_width = num_thread * xLen  // DMA data width matches L2 cacheline
   def dma_temp_mem_depth = 8  // depth of temporary memory in DMA
   def BitsOfByte = 8

@@ -4,9 +4,9 @@
  * Current scope:
  *
  *   Implemented here:  Tensor DMA address generation, OOB fill, element
- *                      stride/subbox iteration, and 32B/64B/128B swizzle.
- *   Not started:       Im2col, shared -> global writeback, descriptor
- *                      prefetch, TC FP16/BF16.
+ *                      stride/subbox iteration, 32B/64B/128B swizzle,
+ *                      descriptor-addressed TMA, and tensor-map prefetch.
+ *   Not started:       Im2col, shared -> global writeback, TC FP16/BF16.
  */
 package pipeline
 
@@ -123,25 +123,68 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   })
 
   val (s_idle :: s_prefetch_tlb_req :: s_prefetch_tlb_rsp ::
-    s_prefetch_l2cache :: s_prefetch_rsp :: s_prefetch_done ::
+    s_prefetch_l2cache ::
     s_desc_tlb_req :: s_desc_tlb_rsp :: s_desc_l2cache :: s_desc_rsp ::
-    s_dyn_tlb_req :: s_dyn_tlb_rsp :: s_dyn_l2cache :: s_dyn_rsp ::
     s_tensor_setup :: s_save :: s_l2cache_tag :: s_tlb_req :: s_tlb_rsp ::
-    s_l2cache :: Nil) = Enum(20)
+    s_l2cache :: Nil) = Enum(14)
   val state = RegInit(s_idle)
   val reg_save = Reg(new DmaRegSave)
   val inst_mem_index_reg = RegInit(0.U(log2Up(max_dma_inst).W))
   val tag_mem_index_reg = RegInit(0.U(log2Ceil(max_dma_tag).W))
   val p_addr_reg = Reg(UInt(SV32.paLen.W))
   val desc_ptr_reg = RegInit(0.U(xLen.W))
-  val dyn_ptr_reg = RegInit(0.U(xLen.W))
   val meta_vaddr_reg = RegInit(0.U(xLen.W))
   val desc_words_reg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
   val dyn_words_reg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
 
   val dmaSourceLowBits = l1cache_sourceBits - log2Ceil(max_dma_tag) - log2Ceil(max_dma_inst)
   require(dmaSourceLowBits > 0, "DMA source encoding needs a spare low bit for metadata responses")
-  val dmaMetaSource = 1.U(l1cache_sourceBits.W)
+  require(tma_desc_cache_entries > 0, "TMA descriptor cache must have at least one entry")
+  require(tma_prefetch_slots > 0, "TMA prefetch response sink must have at least one slot")
+  val dmaMetaKindBits = 2
+  val dmaMetaSlotShift = dmaMetaKindBits + 1
+  val prefetchSlotIdxWidth = log2Ceil(tma_prefetch_slots).max(1)
+  require(dmaMetaSlotShift + prefetchSlotIdxWidth <= l1cache_sourceBits,
+    "DMA metadata source encoding needs enough bits for prefetch slots")
+  val dmaMetaKindPrefetch = 0.U(dmaMetaKindBits.W)
+  val dmaMetaKindDesc = 1.U(dmaMetaKindBits.W)
+  def dmaMetaSource(kind: Int): UInt =
+    ((kind << 1) | 1).U(l1cache_sourceBits.W)
+  def dmaPrefetchSource(slot: UInt): UInt = {
+    val src = Wire(UInt(l1cache_sourceBits.W))
+    src := ((slot << dmaMetaSlotShift).asUInt | dmaMetaSource(0))(l1cache_sourceBits - 1, 0)
+    src
+  }
+  val dmaDescSource = dmaMetaSource(1)
+
+  def alignToL2Line(addr: UInt): UInt =
+    Cat(addr(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
+
+  val prefetchCompleteQ = Module(new Queue(UInt(depth_warp.W), tma_prefetch_slots))
+  val prefetchSlotValid = RegInit(VecInit(Seq.fill(tma_prefetch_slots)(false.B)))
+  val prefetchSlotWid = RegInit(VecInit(Seq.fill(tma_prefetch_slots)(0.U(depth_warp.W))))
+  val prefetchSlotLine = RegInit(VecInit(Seq.fill(tma_prefetch_slots)(0.U(xLen.W))))
+  val prefetchSlotFreeVec = VecInit((0 until tma_prefetch_slots).map(i => !prefetchSlotValid(i)))
+  val prefetchSlotAvailable = prefetchSlotFreeVec.asUInt.orR
+  val prefetchAllocSlot = PriorityEncoder(prefetchSlotFreeVec)
+
+  val descCacheValid = RegInit(VecInit(Seq.fill(tma_desc_cache_entries)(false.B)))
+  val descCacheLine = RegInit(VecInit(Seq.fill(tma_desc_cache_entries)(0.U(xLen.W))))
+  val descCacheData = Reg(Vec(tma_desc_cache_entries, Vec(dcache_BlockWords, UInt(xLen.W))))
+  val descCacheIdxWidth = log2Ceil(tma_desc_cache_entries).max(1)
+  val descCacheReplace = RegInit(0.U(descCacheIdxWidth.W))
+  val incomingDescLine = alignToL2Line(io.from_fifo.bits.in1(0))
+  val incomingDescCacheHitVec = VecInit((0 until tma_desc_cache_entries).map { i =>
+    descCacheValid(i) && descCacheLine(i) === incomingDescLine
+  })
+  val incomingDescCacheHit = incomingDescCacheHitVec.asUInt.orR
+  val incomingDescCacheWords = Wire(Vec(dcache_BlockWords, UInt(xLen.W)))
+  for (w <- 0 until dcache_BlockWords) {
+    incomingDescCacheWords(w) := Mux1H(
+      incomingDescCacheHitVec,
+      (0 until tma_desc_cache_entries).map(i => descCacheData(i)(w))
+    )
+  }
 
   // ---- Tensor iteration state ----
   import DataType._
@@ -189,7 +232,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   desc_byte_stride(0) := Mux(desc_words_reg(9) === 0.U, tensorDataWidth(desc_control(3, 0)), desc_words_reg(9))
   (1 until 5).foreach { x => desc_byte_stride(x) := desc_words_reg(9 + x) }
   val desc_coords = Wire(Vec(5, UInt(xLen.W)))
-  (0 until 5).foreach { x => desc_coords(x) := Mux(dyn_ptr_reg === 0.U, 0.U, dyn_words_reg(x)) }
+  (0 until 5).foreach { x => desc_coords(x) := dyn_words_reg(x) }
   val desc_box_address =
     desc_words_reg(2) +
       desc_coords(0) * desc_byte_stride(0) +
@@ -242,9 +285,6 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
 
   // datawidth derived from dataType — encoding matches spike cp_async_tensor.h.
   tvars.datawidth := tensorDataWidth(tvars.dataType)
-
-  def alignToL2Line(addr: UInt): UInt =
-    Cat(addr(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
 
   // Tensor setup still decodes the descriptor once. The cacheline issue path
   // below then advances with registered offsets and adders instead of repeated
@@ -452,16 +492,14 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   }
 
   // TLB request
-  val aligned_vaddr = Cat(reg_save.address(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
-  val aligned_meta_vaddr = Cat(meta_vaddr_reg(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
+  val aligned_vaddr = alignToL2Line(reg_save.address)
+  val aligned_meta_vaddr = alignToL2Line(meta_vaddr_reg)
   val meta_tlb_req_state =
-    state === s_prefetch_tlb_req || state === s_desc_tlb_req || state === s_dyn_tlb_req
+    state === s_prefetch_tlb_req || state === s_desc_tlb_req
   val meta_tlb_rsp_state =
-    state === s_prefetch_tlb_rsp || state === s_desc_tlb_rsp || state === s_dyn_tlb_rsp
+    state === s_prefetch_tlb_rsp || state === s_desc_tlb_rsp
   val meta_l2cache_state =
-    state === s_prefetch_l2cache || state === s_desc_l2cache || state === s_dyn_l2cache
-  val meta_rsp_state =
-    state === s_prefetch_rsp || state === s_desc_rsp || state === s_dyn_rsp
+    state === s_prefetch_l2cache || state === s_desc_l2cache
   io.to_l2TLB.valid := state === s_tlb_req || meta_tlb_req_state
   io.to_l2TLB.bits.vaddr := Mux(meta_tlb_req_state, aligned_meta_vaddr, aligned_vaddr)
   io.to_l2TLB.bits.asid := reg_save.ctrl.asid.getOrElse(0.U)
@@ -470,11 +508,16 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   io.from_l2TLB.ready := state === s_tlb_rsp || meta_tlb_rsp_state
 
   // L2 cache request — uses translated physical address
-  io.to_l2cache.valid := state === s_l2cache || meta_l2cache_state
+  io.to_l2cache.valid := state === s_l2cache ||
+    state === s_desc_l2cache ||
+    (state === s_prefetch_l2cache && prefetchSlotAvailable)
   io.to_l2cache.bits.a_opcode := 4.U // Get
+  val metaReqSource = MuxCase(dmaDescSource, Seq(
+    (state === s_prefetch_l2cache) -> dmaPrefetchSource(prefetchAllocSlot)
+  ))
   io.to_l2cache.bits.a_source := Mux(
     meta_l2cache_state,
-    dmaMetaSource,
+    metaReqSource,
     Cat(tag_mem_index_reg, inst_mem_index_reg, 0.U(dmaSourceLowBits.W))
   )
   io.to_l2cache.bits.a_addr.foreach(_ := p_addr_reg)
@@ -482,9 +525,25 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   io.to_l2cache.bits.a_data := VecInit(Seq.fill(dcache_BlockWords)(0.U(xLen.W)))
   io.to_l2cache.bits.a_param := 0.U
   io.to_l2cache.bits.spike_info.foreach(_ := io.to_l2cache.bits.defaultSpikeInfo)
-  io.from_l2cache_meta.ready := meta_rsp_state
-  io.meta_complete.valid := state === s_prefetch_done
-  io.meta_complete.bits := reg_save.ctrl.wid
+
+  val metaRspKind = io.from_l2cache_meta.bits.d_source(2, 1)
+  val metaRspIsPrefetch = io.from_l2cache_meta.bits.d_source(0) && metaRspKind === dmaMetaKindPrefetch
+  val metaRspIsDesc = io.from_l2cache_meta.bits.d_source(0) && metaRspKind === dmaMetaKindDesc
+  val prefetchRspSlot = io.from_l2cache_meta.bits.d_source(
+    dmaMetaSlotShift + prefetchSlotIdxWidth - 1,
+    dmaMetaSlotShift)
+  val prefetchRspSlotValid = prefetchSlotValid(prefetchRspSlot)
+  prefetchCompleteQ.io.enq.valid := io.from_l2cache_meta.valid && metaRspIsPrefetch && prefetchRspSlotValid
+  prefetchCompleteQ.io.enq.bits := prefetchSlotWid(prefetchRspSlot)
+  io.from_l2cache_meta.ready := MuxCase(false.B, Seq(
+    metaRspIsPrefetch -> (prefetchRspSlotValid && prefetchCompleteQ.io.enq.ready),
+    metaRspIsDesc -> (state === s_desc_rsp)
+  ))
+  val prefetchRspFire = io.from_l2cache_meta.fire && metaRspIsPrefetch
+  val descRspFire = io.from_l2cache_meta.fire && metaRspIsDesc
+  io.meta_complete.valid := prefetchCompleteQ.io.deq.valid
+  io.meta_complete.bits := prefetchCompleteQ.io.deq.bits
+  prefetchCompleteQ.io.deq.ready := io.meta_complete.ready
 
   io.from_fifo.ready := state === s_idle
 
@@ -507,6 +566,50 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       "TLB paddr page offset mismatch with vaddr")
   }
 
+  when(state === s_prefetch_l2cache && io.to_l2cache.fire) {
+    prefetchSlotValid(prefetchAllocSlot) := true.B
+    prefetchSlotWid(prefetchAllocSlot) := reg_save.ctrl.wid
+    prefetchSlotLine(prefetchAllocSlot) := aligned_meta_vaddr
+  }
+
+  val prefetchRspLine = Wire(UInt(xLen.W))
+  prefetchRspLine := Mux1H(
+    (0 until tma_prefetch_slots).map(i => prefetchRspSlot === i.U),
+    (0 until tma_prefetch_slots).map(i => prefetchSlotLine(i))
+  )
+  when(prefetchRspFire) {
+    prefetchSlotValid(prefetchRspSlot) := false.B
+  }
+
+  val descCacheWrite = prefetchRspFire || descRspFire
+  val descCacheWriteLine = Mux(prefetchRspFire, prefetchRspLine, alignToL2Line(desc_ptr_reg))
+  val descCacheWriteHitVec = VecInit((0 until tma_desc_cache_entries).map { i =>
+    descCacheValid(i) && descCacheLine(i) === descCacheWriteLine
+  })
+  val descCacheWriteHit = descCacheWriteHitVec.asUInt.orR
+  val descCacheInvalidVec = VecInit((0 until tma_desc_cache_entries).map(i => !descCacheValid(i)))
+  val descCacheHasInvalid = descCacheInvalidVec.asUInt.orR
+  val descCacheVictim = Mux(descCacheHasInvalid, PriorityEncoder(descCacheInvalidVec), descCacheReplace)
+  val descCacheWriteIdx = Mux(descCacheWriteHit, PriorityEncoder(descCacheWriteHitVec), descCacheVictim)
+  when(descCacheWrite) {
+    for (i <- 0 until tma_desc_cache_entries) {
+      when(descCacheWriteIdx === i.U) {
+        descCacheValid(i) := true.B
+        descCacheLine(i) := descCacheWriteLine
+        descCacheData(i) := io.from_l2cache_meta.bits.d_data
+      }
+    }
+    when(!descCacheWriteHit) {
+      if (tma_desc_cache_entries > 1) {
+        descCacheReplace := Mux(
+          descCacheWriteIdx === (tma_desc_cache_entries - 1).U,
+          0.U,
+          descCacheWriteIdx + 1.U
+        )
+      }
+    }
+  }
+
   // FSM
   switch(state) {
     is(s_idle) {
@@ -514,7 +617,11 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
         when(io.from_fifo.bits.ctrl.funct === 5.U) {
           state := s_prefetch_tlb_req
         }.elsewhen(io.from_fifo.bits.ctrl.funct === 6.U) {
-          state := s_desc_tlb_req
+          when(incomingDescCacheHit) {
+            state := s_tensor_setup
+          }.otherwise {
+            state := s_desc_tlb_req
+          }
         }.elsewhen(io.from_fifo.bits.ctrl.funct === 3.U) {
           state := s_tensor_setup
         }.otherwise {
@@ -532,13 +639,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       }
     }
     is(s_prefetch_l2cache) {
-      when(io.to_l2cache.fire) { state := s_prefetch_rsp }
-    }
-    is(s_prefetch_rsp) {
-      when(io.from_l2cache_meta.fire) { state := s_prefetch_done }
-    }
-    is(s_prefetch_done) {
-      when(io.meta_complete.fire) { state := s_idle }
+      when(io.to_l2cache.fire) { state := s_idle }
     }
     is(s_desc_tlb_req) {
       when(io.to_l2TLB.fire) { state := s_desc_tlb_rsp }
@@ -553,28 +654,9 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       when(io.to_l2cache.fire) { state := s_desc_rsp }
     }
     is(s_desc_rsp) {
-      when(io.from_l2cache_meta.fire) {
-        when(dyn_ptr_reg === 0.U) {
-          state := s_tensor_setup
-        }.otherwise {
-          state := s_dyn_tlb_req
-        }
+      when(descRspFire) {
+        state := s_tensor_setup
       }
-    }
-    is(s_dyn_tlb_req) {
-      when(io.to_l2TLB.fire) { state := s_dyn_tlb_rsp }
-    }
-    is(s_dyn_tlb_rsp) {
-      when(io.from_l2TLB.fire) {
-        p_addr_reg := io.from_l2TLB.bits.paddr
-        state := s_dyn_l2cache
-      }
-    }
-    is(s_dyn_l2cache) {
-      when(io.to_l2cache.fire) { state := s_dyn_rsp }
-    }
-    is(s_dyn_rsp) {
-      when(io.from_l2cache_meta.fire) { state := s_tensor_setup }
     }
     is(s_tensor_setup) {
       state := s_save
@@ -610,29 +692,23 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
         reg_save.in2 := io.from_fifo.bits.in2
         reg_save.in3 := io.from_fifo.bits.in3
         desc_ptr_reg := io.from_fifo.bits.in1(0)
-        dyn_ptr_reg := io.from_fifo.bits.in2(0)
+        dyn_words_reg := io.from_fifo.bits.in2
         meta_vaddr_reg := io.from_fifo.bits.in1(0)
+        when(io.from_fifo.bits.ctrl.funct === 6.U && incomingDescCacheHit) {
+          desc_words_reg := incomingDescCacheWords
+        }
         // Legacy tensor: initial address from BoxAddress (in2(0)); linear: from src (in1(0)).
-        // Descriptor tensor fills the real BoxAddress after its descriptor/dynamic fetch.
+        // Descriptor tensor fills the real BoxAddress after its descriptor fetch;
+        // dynamic coordinates are supplied by the VRS2 lane payload in in2.
         reg_save.address := Mux(io.from_fifo.bits.ctrl.funct === 3.U,
-          Cat(io.from_fifo.bits.in2(0)(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W)),
-          Cat(io.from_fifo.bits.in1(0)(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W)))
+          alignToL2Line(io.from_fifo.bits.in2(0)),
+          alignToL2Line(io.from_fifo.bits.in1(0)))
         reg_save.ctrl := io.from_fifo.bits.ctrl
       }
     }
     is(s_desc_rsp) {
-      when(io.from_l2cache_meta.fire) {
+      when(descRspFire) {
         desc_words_reg := io.from_l2cache_meta.bits.d_data
-        when(dyn_ptr_reg === 0.U) {
-          dyn_words_reg := VecInit(Seq.fill(32)(0.U(xLen.W)))
-        }.otherwise {
-          meta_vaddr_reg := dyn_ptr_reg
-        }
-      }
-    }
-    is(s_dyn_rsp) {
-      when(io.from_l2cache_meta.fire) {
-        dyn_words_reg := io.from_l2cache_meta.bits.d_data
       }
     }
     is(s_tensor_setup) {

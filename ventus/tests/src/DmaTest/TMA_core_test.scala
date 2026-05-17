@@ -1038,14 +1038,14 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
   def driveTmaDescCmd(
       dut: DMA_core,
       descPtr: Int,
-      dynPtr: Int,
+      dynWords: Seq[BigInt],
       dst: Int,
       wid: Int
   ): Unit = {
     dut.io.dma_req.valid.poke(true.B)
     for (i <- 0 until num_thread) {
       dut.io.dma_req.bits.in1(i).poke((if (i == 0) descPtr else 0).U)
-      dut.io.dma_req.bits.in2(i).poke((if (i == 0) dynPtr else 0).U)
+      dut.io.dma_req.bits.in2(i).poke(dynWords.lift(i).getOrElse(BigInt(0)).U)
       dut.io.dma_req.bits.in3(i).poke((if (i == 0) dst else 0).U)
       dut.io.dma_req.bits.mask(i).poke(true.B)
     }
@@ -1099,22 +1099,62 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
+  def sendDmaRspWords(
+      dut: DMA_core,
+      source: BigInt,
+      words: Seq[BigInt],
+      fences: scala.collection.mutable.ArrayBuffer[BigInt],
+      tag: String
+  ): Unit = {
+    pokeDmaRspWords(dut, source, words)
+    var rspCycles = 0
+    while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < 100) {
+      stepAndSample(dut, fences)
+      rspCycles += 1
+    }
+    assert(dut.io.dma_cache_rsp.ready.peekBoolean(), s"$tag dma_cache_rsp should be ready")
+    stepAndSample(dut, fences)
+    dut.io.dma_cache_rsp.valid.poke(false.B)
+    sampleFence(dut, fences)
+  }
+
+  def captureNextL2ReqNoRsp(
+      dut: DMA_core,
+      fences: scala.collection.mutable.ArrayBuffer[BigInt],
+      tlb: TlbMockState,
+      tag: String,
+      maxCycles: Int = 300
+  ): (BigInt, BigInt) = {
+    var cycles = 0
+    while (!dut.io.dma_cache_req.valid.peekBoolean() && cycles < maxCycles) {
+      mockTlbCycle(dut, fences, tlb)
+      if (!dut.io.dma_cache_req.valid.peekBoolean()) {
+        stepAndSample(dut, fences)
+      }
+      cycles += 1
+    }
+    assert(dut.io.dma_cache_req.valid.peekBoolean(), s"$tag should issue an L2 request")
+    val source = dut.io.dma_cache_req.bits.a_source.peekInt()
+    val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
+    stepAndSample(dut, fences)
+    (source, addr)
+  }
+
   def descriptorServiceUntilDone(
       dut: DMA_core,
       descPtr: Int,
-      dynPtr: Int,
       descWords: Seq[BigInt],
-      dynWords: Seq[BigInt],
       expectedDataL2Count: Int,
       expectedFenceCount: Int,
-      tlb: TlbMockState = new TlbMockState()
+      tlb: TlbMockState = new TlbMockState(),
+      expectedDescFetch: Boolean = true
   ): (Seq[(BigInt, BigInt)], Seq[BigInt], Seq[SharedReqObs]) = {
     val reqs = scala.collection.mutable.ArrayBuffer.empty[(BigInt, BigInt)]
     val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
     val sharedReqObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
     val descLine = descPtr & ~(L2CachelineBytes - 1)
-    val dynLine = dynPtr & ~(L2CachelineBytes - 1)
-    val expectedReqCount = expectedDataL2Count + (if (dynPtr == 0) 1 else 2)
+    val expectedMetaReqCount = if (expectedDescFetch) 1 else 0
+    val expectedReqCount = expectedDataL2Count + expectedMetaReqCount
     var cycles = 0
     val maxCycles = 3000
 
@@ -1131,9 +1171,6 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
           if (addr == descLine) {
             assert(isMeta, "descriptor fetch should use metadata source")
             descWords
-          } else if (dynPtr != 0 && addr == dynLine) {
-            assert(isMeta, "dynamic coords fetch should use metadata source")
-            dynWords
           } else {
             assert(!isMeta, s"data fetch should not use metadata source, addr=0x${addr.toString(16)}")
             (0 until dcache_BlockWords).map(w => BigInt("d0000000", 16) + reqs.length * 0x100 + w * 4)
@@ -1196,25 +1233,23 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
         dst = 0x800
       )
       val descPtr = 0x20000
-      val dynPtr = 0x20100
       val expectedDataReqs = TmaRefModel.computeExpectedL2Addrs(cmd)
 
-      driveTmaDescCmd(dut, descPtr, dynPtr, cmd.dst, cmd.wid)
+      driveTmaDescCmd(dut, descPtr, coordWords(coords), cmd.dst, cmd.wid)
       val (reqs, fenceResult, sharedObs) = descriptorServiceUntilDone(
         dut,
         descPtr,
-        dynPtr,
         descriptorWordsFor(cmd),
-        coordWords(coords),
         expectedDataReqs.length,
         1)
 
-      val reqAddrs = reqs.map(_._2.toInt)
-      val dataReqAddrs = reqs.drop(2).map(_._2.toInt)
-      assert(reqAddrs.take(2) == Seq(descPtr, dynPtr),
-        s"T26 metadata request order mismatch: got=${reqAddrs.take(2).map(a => f"0x$a%x")}")
-      assert(dataReqAddrs == expectedDataReqs,
-        s"T26 data request addrs mismatch:\n  got=${dataReqAddrs.map(a => f"0x$a%x")}\n  exp=${expectedDataReqs.map(a => f"0x$a%x")}")
+	      val reqAddrs = reqs.map(_._2.toInt)
+	      val dataReqAddrs = reqs.drop(1).map(_._2.toInt)
+	      assert(reqAddrs.head == descPtr,
+	        f"T26 descriptor request mismatch: got=0x${reqAddrs.head}%x")
+	      assert((reqs.head._1 & 0x7) == 0x3, s"T26 descriptor source kind mismatch: ${reqs.head._1}")
+	      assert(dataReqAddrs == expectedDataReqs,
+	        s"T26 data request addrs mismatch:\n  got=${dataReqAddrs.map(a => f"0x$a%x")}\n  exp=${expectedDataReqs.map(a => f"0x$a%x")}")
       assert(fenceResult.contains(BigInt(cmd.wid)), "T26 fence mismatch")
       assert(sharedObs.nonEmpty, "T26 should issue shared memory writes")
     }
@@ -1229,17 +1264,140 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
       val (reqs, fences, sharedObs) = descriptorServiceUntilDone(
         dut,
         descPtr,
-        0,
-        Seq.fill(32)(0),
         Seq.fill(32)(0),
         expectedDataL2Count = 0,
         expectedFenceCount = 1)
 
-      assert(reqs.size == 1, "T27 should issue exactly one descriptor-line read")
-      assert((reqs.head._1 & 1) == 1, "T27 prefetch should use metadata source")
-      assert(reqs.head._2 == BigInt(descPtr), s"T27 prefetch addr mismatch: got=0x${reqs.head._2.toString(16)}")
-      assert(fences.contains(BigInt(wid)), "T27 prefetch completion should release DMA inflight")
-      assert(sharedObs.isEmpty, "T27 prefetch must not emit shared-memory writes")
-    }
-  }
-}
+	      assert(reqs.size == 1, "T27 should issue exactly one descriptor-line read")
+	      assert((reqs.head._1 & 1) == 1, "T27 prefetch should use metadata source")
+	      assert((reqs.head._1 & 0x7) == 0x1, s"T27 prefetch source kind mismatch: ${reqs.head._1}")
+	      assert(reqs.head._2 == BigInt(descPtr), s"T27 prefetch addr mismatch: got=0x${reqs.head._2.toString(16)}")
+	      assert(fences.contains(BigInt(wid)), "T27 prefetch completion should release DMA inflight")
+	      assert(sharedObs.isEmpty, "T27 prefetch must not emit shared-memory writes")
+	    }
+	  }
+
+	  "TMA_T28_prefetch_releases_issue_path_before_response" in {
+	    test(new DMA_core).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+	      initDut(dut)
+	      val cmd = TmaCmd(
+	        name = "T28_prefetch_overlap",
+	        wid = 6,
+	        dataType = 6,
+	        tensorRank = 2,
+	        globalAddress = 0xC0000,
+	        globalDim = Seq(4, 4, 1, 1, 1),
+	        globalStrides = Seq(16, 0, 0, 0, 0),
+	        boxAddress = 0xC0000,
+	        boxDim = Seq(4, 4, 1, 1, 1),
+	        elementStrides = Seq(1, 1, 1, 1, 1),
+	        dst = 0x900
+	      )
+	      val descPtr = 0x2A000
+	      val prefetchWid = 5
+	      val descWords = descriptorWordsFor(cmd)
+	      val expectedDataReqs = TmaRefModel.computeExpectedL2Addrs(cmd)
+	      val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
+	      val tlb = new TlbMockState()
+
+	      driveTmaPrefetch(dut, descPtr, prefetchWid)
+	      val prefetchReq = captureNextL2ReqNoRsp(dut, fences, tlb, "T28 prefetch")
+	      assert((prefetchReq._1 & 0x7) == 0x1, s"T28 prefetch source kind mismatch: ${prefetchReq._1}")
+	      assert(prefetchReq._2 == BigInt(descPtr), s"T28 prefetch addr mismatch: 0x${prefetchReq._2.toString(16)}")
+	      assert(dut.io.dma_req.ready.peekBoolean(),
+	        "T28 prefetch should release issue path immediately after L2 request fire")
+
+	      driveTmaDescCmd(dut, descPtr, Seq.fill(32)(0), cmd.dst, cmd.wid)
+	      val descReq = captureNextL2ReqNoRsp(dut, fences, tlb, "T28 descriptor")
+	      assert((descReq._1 & 0x7) == 0x3, s"T28 descriptor source kind mismatch: ${descReq._1}")
+	      assert(descReq._2 == BigInt(descPtr),
+	        s"T28 descriptor should issue before prefetch response, got addr=0x${descReq._2.toString(16)}")
+
+	      sendDmaRspWords(dut, prefetchReq._1, descWords, fences, "T28 prefetch")
+	      sendDmaRspWords(dut, descReq._1, descWords, fences, "T28 descriptor")
+
+	      val dataReqs = scala.collection.mutable.ArrayBuffer.empty[(BigInt, BigInt)]
+	      val sharedObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
+	      var cycles = 0
+	      while ((dataReqs.length < expectedDataReqs.length || !fences.contains(BigInt(cmd.wid))) && cycles < 2000) {
+	        var progressed = false
+	        mockTlbCycle(dut, fences, tlb)
+	        if (dut.io.dma_cache_req.valid.peekBoolean()) {
+	          val source = dut.io.dma_cache_req.bits.a_source.peekInt()
+	          val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
+	          assert((source & 1) == 0, s"T28 data request should not use metadata source: $source")
+	          dataReqs += ((source, addr))
+	          stepAndSample(dut, fences)
+	          val payload = (0 until dcache_BlockWords).map(w => BigInt("e0000000", 16) + dataReqs.length * 0x100 + w * 4)
+	          sendDmaRspWords(dut, source, payload, fences, "T28 data")
+	          progressed = true
+	        } else {
+	          collectSharedReq(dut, "T28 shared") match {
+	            case Some(plan) =>
+	              sharedObs += plan
+	              sendSharedRsp(dut, plan, fences)
+	              progressed = true
+	            case None =>
+	          }
+	        }
+	        sampleFence(dut, fences)
+	        if (!progressed) stepAndSample(dut, fences)
+	        cycles += 1
+	      }
+
+	      assert(dataReqs.map(_._2.toInt) == expectedDataReqs,
+	        s"T28 data request addrs mismatch: got=${dataReqs.map(_._2.toString(16))}")
+	      assert(fences.contains(BigInt(prefetchWid)), "T28 prefetch fence missing")
+	      assert(fences.contains(BigInt(cmd.wid)), "T28 descriptor TMA fence missing")
+	      assert(sharedObs.nonEmpty, "T28 should complete shared writes")
+	    }
+	  }
+
+	  "TMA_T29_descriptor_cache_reuses_fetched_descriptor" in {
+	    test(new DMA_core).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
+	      initDut(dut)
+	      val cmd = TmaCmd(
+	        name = "T29_descriptor_cache",
+	        wid = 7,
+	        dataType = 6,
+	        tensorRank = 2,
+	        globalAddress = 0xD0000,
+	        globalDim = Seq(4, 4, 1, 1, 1),
+	        globalStrides = Seq(16, 0, 0, 0, 0),
+	        boxAddress = 0xD0000,
+	        boxDim = Seq(4, 4, 1, 1, 1),
+	        elementStrides = Seq(1, 1, 1, 1, 1),
+	        dst = 0xA00
+	      )
+	      val descPtr = 0x2C000
+	      val descWords = descriptorWordsFor(cmd)
+	      val expectedDataReqs = TmaRefModel.computeExpectedL2Addrs(cmd)
+
+	      driveTmaDescCmd(dut, descPtr, Seq.fill(32)(0), cmd.dst, cmd.wid)
+	      val (firstReqs, firstFences, _) = descriptorServiceUntilDone(
+	        dut,
+	        descPtr,
+	        descWords,
+	        expectedDataReqs.length,
+	        1)
+	      assert((firstReqs.head._1 & 0x7) == 0x3, "T29 first run should fetch descriptor")
+	      assert(firstFences.contains(BigInt(cmd.wid)), "T29 first fence missing")
+
+	      driveTmaDescCmd(dut, descPtr, Seq.fill(32)(0), cmd.dst + 0x100, cmd.wid)
+	      val (secondReqs, secondFences, sharedObs) = descriptorServiceUntilDone(
+	        dut,
+	        descPtr,
+	        descWords,
+	        expectedDataReqs.length,
+	        1,
+	        tlb = new TlbMockState(),
+	        expectedDescFetch = false)
+	      assert(secondReqs.forall(req => (req._1 & 1) == 0),
+	        s"T29 second run should hit descriptor cache and issue only data requests: ${secondReqs.map(_._1)}")
+	      assert(secondReqs.map(_._2.toInt) == expectedDataReqs,
+	        s"T29 cached descriptor data addr mismatch: got=${secondReqs.map(_._2.toString(16))}")
+	      assert(secondFences.contains(BigInt(cmd.wid)), "T29 second fence missing")
+	      assert(sharedObs.nonEmpty, "T29 second run should issue shared writes")
+	    }
+	  }
+	}
