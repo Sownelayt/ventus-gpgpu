@@ -22,6 +22,7 @@ class NoCacheDcacheRspRoute extends Bundle {
   val isDma = Bool()
   val dmaSource = UInt(l1cache_sourceBits.W)
   val dmaAddr = UInt(xLen.W)
+  val dmaRspOpcode = UInt(3.W)
 }
 
 @instantiable
@@ -83,6 +84,7 @@ class SM_wrapper_nocache() extends Module {
   pipe.io.dma_shared_rsp.bits.data := sharedmem.io.coreRsp.bits.data
   pipe.io.dma_shared_rsp.bits.instrId := sharedmem.io.coreRsp.bits.instrId
   pipe.io.dma_shared_rsp.bits.activeMask := sharedmem.io.coreRsp.bits.activeMask
+  pipe.io.dma_shared_rsp.bits.isWrite := sharedmem.io.coreRsp.bits.isWrite
   sharedmem.io.coreRsp.ready := Mux(sharedRspFromDma, pipe.io.dma_shared_rsp.ready, pipe.io.shared_rsp.ready)
 
   val icache = Module(new InstructionCache()(param))
@@ -145,13 +147,18 @@ class SM_wrapper_nocache() extends Module {
   dcacheRspRouteQ.io.enq.bits.isDma := dcacheReqArb.io.chosen === 1.U
   dcacheRspRouteQ.io.enq.bits.dmaSource := pipe.io.dma_cache_req.bits.a_source
   dcacheRspRouteQ.io.enq.bits.dmaAddr := dmaLineAddr
+  dcacheRspRouteQ.io.enq.bits.dmaRspOpcode := Mux(
+    pipe.io.dma_cache_req.bits.a_opcode === 4.U,
+    1.U,
+    Mux(pipe.io.dma_cache_req.bits.a_opcode === 0.U || pipe.io.dma_cache_req.bits.a_opcode === 1.U, 0.U, 2.U)
+  )
 
   val dcacheRspRouteValid = dcacheRspRouteQ.io.deq.valid
   val dcacheRspFromDma = dcacheRspRouteQ.io.deq.bits.isDma
   pipe.io.dcache_rsp.valid := io.dcache_rsp.valid && dcacheRspRouteValid && !dcacheRspFromDma
   pipe.io.dcache_rsp.bits := io.dcache_rsp.bits
   pipe.io.dma_cache_rsp.valid := io.dcache_rsp.valid && dcacheRspRouteValid && dcacheRspFromDma
-  pipe.io.dma_cache_rsp.bits.d_opcode := 1.U
+  pipe.io.dma_cache_rsp.bits.d_opcode := dcacheRspRouteQ.io.deq.bits.dmaRspOpcode
   pipe.io.dma_cache_rsp.bits.d_param := 0.U
   pipe.io.dma_cache_rsp.bits.d_source := dcacheRspRouteQ.io.deq.bits.dmaSource
   pipe.io.dma_cache_rsp.bits.d_addr := dcacheRspRouteQ.io.deq.bits.dmaAddr

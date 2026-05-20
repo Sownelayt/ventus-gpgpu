@@ -52,7 +52,7 @@ class warp_scheduler extends Module{
 
   val warp_end=io.warp_control.fire&io.warp_control.bits.ctrl.simt_stack_op
   val warp_end_id=io.warp_control.bits.ctrl.wid
-  val is_dma_fence = io.warp_control.bits.ctrl.dma && io.warp_control.bits.ctrl.funct === 4.U
+  val is_dma_fence = io.warp_control.bits.ctrl.dma && io.warp_control.bits.ctrl.funct === 6.U
   val warp_ctrl_is_dma_fence = io.warp_control.fire && is_dma_fence
   val warp_ctrl_is_barrier = io.warp_control.fire && !io.warp_control.bits.ctrl.simt_stack_op && !is_dma_fence
   val current_warp=RegInit(0.U(depth_warp.W))

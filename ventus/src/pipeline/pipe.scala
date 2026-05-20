@@ -62,7 +62,7 @@ class pipe() extends Module{
     val dma_cache_req = DecoupledIO(new DCacheMemReq_p)
     val dma_cache_rsp = Flipped(DecoupledIO(new DCacheMemRsp))
     val dma_shared_req = DecoupledIO(new ShareMemCoreReq_np)
-    val dma_shared_rsp = Flipped(DecoupledIO(new DCacheCoreRsp_np))
+    val dma_shared_rsp = Flipped(DecoupledIO(new DmaSharedRsp))
     // DMA TLB ports
     val dma_tlb_req = DecoupledIO(new L1TlbReq(SV32))
     val dma_tlb_rsp = Flipped(DecoupledIO(new L1TlbRsp(SV32)))

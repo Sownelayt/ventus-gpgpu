@@ -98,7 +98,7 @@ class Issue extends Module{
   io.out_CSR.valid:=false.B
   io.out_SFU.valid:=false.B
   inputBuf.ready:=false.B
-  when(inputBuf.bits.ctrl.dma && inputBuf.bits.ctrl.funct === 4.U){
+  when(inputBuf.bits.ctrl.dma && inputBuf.bits.ctrl.funct === 6.U){
     io.out_warpscheduler.valid:=inputBuf.valid
     inputBuf.ready:=io.out_warpscheduler.ready
   }.elsewhen(inputBuf.bits.ctrl.dma){
@@ -254,7 +254,7 @@ class IssueV2 extends Module {
     arb_MUL.io.in(i).valid := false.B
     arb_TC.io.in(i).valid := false.B
     arb_DMA.io.in(i).valid := false.B
-    when(inputBuf(i).deq().ctrl.dma && inputBuf(i).deq().ctrl.funct === 4.U){  // DMA fence
+    when(inputBuf(i).deq().ctrl.dma && inputBuf(i).deq().ctrl.funct === 6.U){  // DMA wait-all
       arb_warpscheduler.io.in(i).valid := inputBuf(i).valid
       inputBuf(i).ready := arb_warpscheduler.io.in(i).ready
     }.elsewhen(inputBuf(i).deq().ctrl.dma){  // DMA data

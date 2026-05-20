@@ -860,6 +860,7 @@ if(!MMU_ENABLED) {
   pipe.io.dma_shared_rsp.bits.data := sharedmem.io.coreRsp.bits.data
   pipe.io.dma_shared_rsp.bits.instrId := sharedmem.io.coreRsp.bits.instrId
   pipe.io.dma_shared_rsp.bits.activeMask := sharedmem.io.coreRsp.bits.activeMask
+  pipe.io.dma_shared_rsp.bits.isWrite := sharedmem.io.coreRsp.bits.isWrite
 
   sharedmem.io.coreRsp.ready := Mux(shared_rsp_from_dma, pipe.io.dma_shared_rsp.ready, pipe.io.shared_rsp.ready)
   

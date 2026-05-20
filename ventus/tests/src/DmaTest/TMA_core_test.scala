@@ -247,57 +247,37 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
   }
 
   // ---- TMA-specific driver ----
+  private var pendingTmaDescPtr: Int = 0
+  private var pendingTmaDescWords: Seq[BigInt] = Seq.fill(32)(0)
+  private var pendingTmaDescFetch: Boolean = false
+
+  def descPtrForCmd(cmd: TmaCmd): Int =
+    0x20000 + ((cmd.wid & 0xff) * L2CachelineBytes)
+
+  def coordsFromCmd(cmd: TmaCmd): Seq[Int] = {
+    val dw = TmaRefModel.datawidthFromType(cmd.dataType)
+    val coords = Array.fill(5)(0)
+    var rem = cmd.boxAddress - cmd.globalAddress
+    for (d <- (1 until cmd.tensorRank).reverse) {
+      val stride = cmd.globalStrides(d - 1)
+      if (stride != 0) {
+        coords(d) = rem / stride
+        rem = rem % stride
+      }
+    }
+    coords(0) = rem / dw
+    coords.toSeq
+  }
+
   def driveTmaCmd(
       dut: DMA_core,
       cmd: TmaCmd,
       fences: scala.collection.mutable.ArrayBuffer[BigInt] = scala.collection.mutable.ArrayBuffer.empty[BigInt]
   ): Unit = {
-    dut.io.dma_req.valid.poke(true.B)
-    // in1: lane mapping for global tensor params
-    for (i <- 0 until num_thread) {
-      val v = i match {
-        case 0  => cmd.dataType
-        case 1  => cmd.tensorRank
-        case 2  => cmd.globalAddress
-        case x if x >= 3 && x <= 7  => cmd.globalDim(x - 3)
-        case x if x >= 8 && x <= 12 => cmd.globalStrides(x - 8)
-        case _ => 0
-      }
-      dut.io.dma_req.bits.in1(i).poke(v.U)
-    }
-    // in2: lane mapping for box params
-    for (i <- 0 until num_thread) {
-      val v = i match {
-        case 0  => cmd.boxAddress
-        case x if x >= 1 && x <= 5   => cmd.boxDim(x - 1)
-        case x if x >= 6 && x <= 10  => cmd.elementStrides(x - 6)
-        case 11 => 0  // interleaveMode
-        case 12 => 0  // swizzleMode
-        case 13 => 0  // L2promotion
-        case 14 => cmd.oobfill
-        case _  => 0
-      }
-      dut.io.dma_req.bits.in2(i).poke(v.U)
-    }
-    // in3: lane 0 = dst
-    for (i <- 0 until num_thread) {
-      dut.io.dma_req.bits.in3(i).poke(if (i == 0) cmd.dst.U else 0.U)
-      dut.io.dma_req.bits.mask(i).poke(true.B)
-    }
-    pokeCtrlSigsZero(dut.io.dma_req.bits.ctrl)
-    pokeCtrlSpikeInfo(dut.io.dma_req.bits.ctrl)
-    dut.io.dma_req.bits.ctrl.dma.poke(true.B)
-    dut.io.dma_req.bits.ctrl.funct.poke(3.U)
-    dut.io.dma_req.bits.ctrl.wid.poke(cmd.wid.U)
-
-    var cycles = 0
-    while (!dut.io.dma_req.ready.peekBoolean() && cycles < 50) {
-      stepAndSample(dut, fences)
-      cycles += 1
-    }
-    assert(dut.io.dma_req.ready.peekBoolean(), s"${cmd.name}: dma_req should be ready")
-    stepAndSample(dut, fences)
-    dut.io.dma_req.valid.poke(false.B)
+    pendingTmaDescPtr = descPtrForCmd(cmd)
+    pendingTmaDescWords = descriptorWordsFor(cmd)
+    pendingTmaDescFetch = true
+    driveTmaDescCmd(dut, pendingTmaDescPtr, coordWords(coordsFromCmd(cmd)), cmd.dst, cmd.wid)
   }
 
   def collectSharedReq(dut: DMA_core, tag: String): Option[SharedReqObs] = {
@@ -345,8 +325,53 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     sampleFence(dut, fences)
   }
 
-  /** Service loop: handle L2 requests/responses and shared memory until all expected
-    * cachelines are fetched and fences are received. */
+  def respondDmaReqWords(
+      dut: DMA_core,
+      source: BigInt,
+      words: Seq[BigInt],
+      fences: scala.collection.mutable.ArrayBuffer[BigInt],
+      tag: String,
+      rspLimit: Int = 100
+  ): Unit = {
+    stepAndSample(dut, fences)
+    dut.io.dma_cache_rsp.valid.poke(true.B)
+    dut.io.dma_cache_rsp.bits.d_opcode.poke(1.U)
+    dut.io.dma_cache_rsp.bits.d_source.poke(source.U)
+    dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+    for (w <- 0 until dcache_BlockWords) {
+      dut.io.dma_cache_rsp.bits.d_data(w).poke(words(w).U)
+    }
+    var rspCycles = 0
+    while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < rspLimit) {
+      stepAndSample(dut, fences)
+      rspCycles += 1
+    }
+    assert(dut.io.dma_cache_rsp.ready.peekBoolean(), s"$tag dma_cache_rsp should be ready")
+    stepAndSample(dut, fences)
+    dut.io.dma_cache_rsp.valid.poke(false.B)
+    sampleFence(dut, fences)
+  }
+
+  def servicePendingDescriptorReq(
+      dut: DMA_core,
+      source: BigInt,
+      addr: BigInt,
+      fences: scala.collection.mutable.ArrayBuffer[BigInt],
+      tag: String
+  ): Boolean = {
+    val isMeta = (source & 1) == 1
+    if (!isMeta) return false
+    val descLine = pendingTmaDescPtr & ~(L2CachelineBytes - 1)
+    assert(addr == BigInt(descLine),
+      s"$tag descriptor fetch addr mismatch: got=0x${addr.toString(16)} exp=0x${descLine.toHexString}")
+    assert(pendingTmaDescFetch, s"$tag saw unexpected descriptor fetch")
+    respondDmaReqWords(dut, source, pendingTmaDescWords, fences, s"$tag descriptor")
+    pendingTmaDescFetch = false
+    true
+  }
+
+  /** Service loop: handle descriptor fetches, tensor L2 requests/responses,
+    * and shared memory until all expected data cachelines and fences complete. */
   def tmaServiceUntilDone(
       dut: DMA_core,
       expectedL2Count: Int,
@@ -357,36 +382,25 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
     val sharedReqObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
     var cycles = 0
-    val maxCycles = 2000
+    val maxCycles = 3000
 
     while ((reqs.length < expectedL2Count || fences.length < expectedFenceCount) && cycles < maxCycles) {
       var progressed = false
-
       mockTlbCycle(dut, fences, tlb)
 
       if (dut.io.dma_cache_req.valid.peekBoolean()) {
         val source = dut.io.dma_cache_req.bits.a_source.peekInt()
         val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
-        reqs += ((source, addr))
-
-        stepAndSample(dut, fences)
-        dut.io.dma_cache_rsp.valid.poke(true.B)
-        dut.io.dma_cache_rsp.bits.d_opcode.poke(1.U)
-        dut.io.dma_cache_rsp.bits.d_source.poke(source.U)
-        dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
-        for (w <- 0 until dcache_BlockWords) {
-          dut.io.dma_cache_rsp.bits.d_data(w).poke((0xA0000000L + reqs.length * 0x100 + w * 4).U)
+        if (servicePendingDescriptorReq(dut, source, addr, fences, "tmaService")) {
+          progressed = true
+        } else {
+          reqs += ((source, addr))
+          val words = (0 until dcache_BlockWords).map { w =>
+            BigInt(0xA0000000L) + BigInt(reqs.length) * 0x100 + BigInt(w * 4)
+          }
+          respondDmaReqWords(dut, source, words, fences, "tmaService", rspLimit = 30)
+          progressed = true
         }
-        var rspCycles = 0
-        while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < 30) {
-          stepAndSample(dut, fences)
-          rspCycles += 1
-        }
-        assert(dut.io.dma_cache_rsp.ready.peekBoolean(), "dma_cache_rsp should be ready")
-        stepAndSample(dut, fences)
-        dut.io.dma_cache_rsp.valid.poke(false.B)
-        sampleFence(dut, fences)
-        progressed = true
       } else {
         var keepDrainingShared = true
         while (keepDrainingShared) {
@@ -402,10 +416,7 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
       }
 
       sampleFence(dut, fences)
-
-      if (!progressed) {
-        stepAndSample(dut, fences)
-      }
+      if (!progressed) stepAndSample(dut, fences)
       cycles += 1
     }
 
@@ -607,11 +618,8 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
   }
 
   // =====================================================================
-  /** Service loop with deterministic per-row L2 response:
-    * - The N-th L2 request gets d_data(w) = (N << 28) | (w & 0xFFFFFFF)
-    *   so that the top 4 bits encode which "row iteration" (1-based) it belongs to.
-    * - Returns (reqs, fences, sharedObs) same as tmaServiceUntilDone.
-    */
+  /** Service loop with deterministic per-row L2 response. Descriptor metadata
+    * fetches are serviced first and are not counted as data rows. */
   def tmaServiceWithRowTaggedData(
       dut: DMA_core,
       expectedL2Count: Int,
@@ -622,7 +630,7 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
     val sharedReqObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
     var cycles = 0
-    val maxCycles = 2000
+    val maxCycles = 3000
 
     while ((reqs.length < expectedL2Count || fences.length < expectedFenceCount) && cycles < maxCycles) {
       var progressed = false
@@ -631,28 +639,17 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
       if (dut.io.dma_cache_req.valid.peekBoolean()) {
         val source = dut.io.dma_cache_req.bits.a_source.peekInt()
         val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
-        reqs += ((source, addr))
-        val rowTag = reqs.length  // 1-based row index
-
-        stepAndSample(dut, fences)
-        dut.io.dma_cache_rsp.valid.poke(true.B)
-        dut.io.dma_cache_rsp.bits.d_opcode.poke(1.U)
-        dut.io.dma_cache_rsp.bits.d_source.poke(source.U)
-        dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
-        for (w <- 0 until dcache_BlockWords) {
-          val payload = ((BigInt(rowTag) & 0xf) << 28) | BigInt(w * 4)
-          dut.io.dma_cache_rsp.bits.d_data(w).poke(payload.U)
+        if (servicePendingDescriptorReq(dut, source, addr, fences, "tmaServiceRowTag")) {
+          progressed = true
+        } else {
+          reqs += ((source, addr))
+          val rowTag = reqs.length
+          val words = (0 until dcache_BlockWords).map { w =>
+            ((BigInt(rowTag) & 0xf) << 28) | BigInt(w * 4)
+          }
+          respondDmaReqWords(dut, source, words, fences, "tmaServiceRowTag", rspLimit = 30)
+          progressed = true
         }
-        var rspCycles = 0
-        while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < 30) {
-          stepAndSample(dut, fences)
-          rspCycles += 1
-        }
-        assert(dut.io.dma_cache_rsp.ready.peekBoolean(), "dma_cache_rsp should be ready")
-        stepAndSample(dut, fences)
-        dut.io.dma_cache_rsp.valid.poke(false.B)
-        sampleFence(dut, fences)
-        progressed = true
       } else {
         var keepDrainingShared = true
         while (keepDrainingShared) {
@@ -764,43 +761,41 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
-  /** Like tmaServiceWithRowTaggedData, but BATCHES pending L2 responses: let N
-    * requests fire before responding to any of them. This exposes tag-slot /
-    * data-slot aliasing races that the lock-step mock hides. Used to reproduce
-    * the RTL-only P0-3 failure.
-    */
+  /** Like tmaServiceWithRowTaggedData, but BATCHES pending data L2 responses.
+    * Descriptor metadata fetches are serviced immediately before data batching. */
   def tmaServiceBatchedResponses(
       dut: DMA_core,
       expectedL2Count: Int,
       expectedFenceCount: Int,
-      batchBeforeRsp: Int = 4,    // hold back this many L2 rsp before draining
+      batchBeforeRsp: Int = 4,
       tlb: TlbMockState = new TlbMockState()
   ): (Seq[(BigInt, BigInt)], Seq[BigInt], Seq[SharedReqObs]) = {
     val reqs = scala.collection.mutable.ArrayBuffer.empty[(BigInt, BigInt)]
-    val pendingRsp = scala.collection.mutable.Queue.empty[(BigInt, Int)] // (source, rowTag)
+    val pendingRsp = scala.collection.mutable.Queue.empty[(BigInt, Int)]
     val fences = scala.collection.mutable.ArrayBuffer.empty[BigInt]
     val sharedReqObs = scala.collection.mutable.ArrayBuffer.empty[SharedReqObs]
     var cycles = 0
-    val maxCycles = 4000
+    val maxCycles = 5000
 
     while ((reqs.length < expectedL2Count || fences.length < expectedFenceCount) && cycles < maxCycles) {
       var progressed = false
       mockTlbCycle(dut, fences, tlb)
 
-      // 1) capture any new L2 request, but don't respond yet
       if (dut.io.dma_cache_req.valid.peekBoolean()) {
         val source = dut.io.dma_cache_req.bits.a_source.peekInt()
         val addr = dut.io.dma_cache_req.bits.a_addr.map(_.peekInt()).getOrElse(BigInt(0))
-        reqs += ((source, addr))
-        pendingRsp += ((source, reqs.length))
-        stepAndSample(dut, fences)
-        progressed = true
+        if (servicePendingDescriptorReq(dut, source, addr, fences, "batchService")) {
+          progressed = true
+        } else {
+          reqs += ((source, addr))
+          pendingRsp += ((source, reqs.length))
+          stepAndSample(dut, fences)
+          progressed = true
+        }
       }
 
-      // 2) drain pending L2 responses only when batch reaches threshold or no more
-      //    requests expected. This keeps multiple tag slots in-flight simultaneously.
-      val shouldDrain = (pendingRsp.nonEmpty &&
-        (pendingRsp.size >= batchBeforeRsp || reqs.length >= expectedL2Count))
+      val shouldDrain = pendingRsp.nonEmpty &&
+        (pendingRsp.size >= batchBeforeRsp || reqs.length >= expectedL2Count)
       if (shouldDrain) {
         while (pendingRsp.nonEmpty) {
           val (source, rowTag) = pendingRsp.dequeue()
@@ -818,10 +813,9 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
             rspCycles += 1
           }
           if (rspCycles >= 100) {
-            // Drain shared_req loopback to unblock Temp_mem, then retry
             collectSharedReq(dut, "batchDrain") match {
               case Some(plan) => sharedReqObs += plan; sendSharedRsp(dut, plan, fences)
-              case None => // shared path idle too, need more cycles
+              case None =>
             }
             rspCycles = 0
             while (!dut.io.dma_cache_rsp.ready.peekBoolean() && rspCycles < 200) {
@@ -837,7 +831,6 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
         progressed = true
       }
 
-      // 3) drain any shared_req that have piled up
       var keepDrainingShared = true
       while (keepDrainingShared) {
         collectSharedReq(dut, "batchService") match {
@@ -1052,7 +1045,7 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     pokeCtrlSigsZero(dut.io.dma_req.bits.ctrl)
     pokeCtrlSpikeInfo(dut.io.dma_req.bits.ctrl)
     dut.io.dma_req.bits.ctrl.dma.poke(true.B)
-    dut.io.dma_req.bits.ctrl.funct.poke(6.U)
+    dut.io.dma_req.bits.ctrl.funct.poke(3.U)
     dut.io.dma_req.bits.ctrl.wid.poke(wid.U)
 
     var cycles = 0
@@ -1214,7 +1207,7 @@ class TMA_core_test extends AnyFreeSpec with ChiselScalatestTester {
     (reqs.toSeq, fences.distinct.toSeq, sharedReqObs.toSeq)
   }
 
-  "TMA_T26_descriptor_g2s_fetches_descriptor_and_coords" in {
+  "TMA_T26_descriptor_funct3_fetches_descriptor_and_coords" in {
     test(new DMA_core).withAnnotations(Seq(WriteVcdAnnotation)) { dut =>
       initDut(dut)
       val coords = Seq(2, 2, 0, 0, 0)
