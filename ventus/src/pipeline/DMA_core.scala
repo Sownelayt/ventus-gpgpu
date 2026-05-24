@@ -83,6 +83,7 @@ class vExeDataDMA extends Bundle {
 // Tag info for each L2 cacheline request
 class DmaCachelineInfo extends Bundle {
   val tag = UInt(xLen.W)
+  val inst_index = UInt(log2Ceil(max_dma_inst).W)
   val tensor_dim_step   = Vec(5, UInt(xLen.W))
   val box_dim0_start    = UInt(xLen.W)
   val tensor_dim0_start = UInt(xLen.W)
@@ -90,6 +91,7 @@ class DmaCachelineInfo extends Bundle {
   val shared_row_base   = UInt(xLen.W)
   val dim0_stride_bytes = UInt(xLen.W)
   val swizzle_row_low   = UInt(3.W)
+  val tensor_copy       = Bool()
   val tensor_interleave = Bool()
   val tensor_elem_valid = Bool()
   val tensor_elem_addr  = UInt(xLen.W)
@@ -123,6 +125,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
     val tag_mem_index = Input(UInt(log2Ceil(max_dma_tag).W))
     val to_l2cache = DecoupledIO(new DCacheMemReq_p)
     val from_l2cache_meta = Flipped(DecoupledIO(new DCacheMemRsp))
+    val tag_reuse_hit = Input(Bool())
     val meta_complete = DecoupledIO(UInt(depth_warp.W))
     val to_l2TLB = DecoupledIO(new L1TlbReq(SV32))
     val from_l2TLB = Flipped(DecoupledIO(new L1TlbRsp(SV32)))
@@ -540,12 +543,14 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   // Temp tag store interface
   io.to_tempmem_tag.valid := state === s_l2cache_tag
   io.to_tempmem_tag.bits.tag := Cat(reg_save.address(xLen - 1, xLen - addr_tag_bits), 0.U((xLen - addr_tag_bits).W))
+  io.to_tempmem_tag.bits.inst_index := inst_mem_index_reg
   io.to_tempmem_tag.bits.box_dim0_start := box_dim0_start
   io.to_tempmem_tag.bits.tensor_dim0_start := tensor_dim0_row_start
   io.to_tempmem_tag.bits.tensor_high_dim_valid := tensor_high_dim_valid
   io.to_tempmem_tag.bits.shared_row_base := tensor_shared_row_base_reg
   io.to_tempmem_tag.bits.dim0_stride_bytes := tensor_dim_stride_bytes_reg(0)
   io.to_tempmem_tag.bits.swizzle_row_low := tensor_swizzle_row_low_reg
+  io.to_tempmem_tag.bits.tensor_copy := tensor_copy_mode
   io.to_tempmem_tag.bits.tensor_interleave := tensor_interleave_mode
   io.to_tempmem_tag.bits.tensor_elem_valid := tensor_high_dim_valid &&
     (tensor_global_pos_reg(0) < tvars.globalDim(0))
@@ -624,7 +629,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
 
   // TLB page offset consistency assertion
   when(!reset.asBool && (state === s_tlb_rsp || meta_tlb_rsp_state) && io.from_l2TLB.fire) {
-    val tlb_check_vaddr = Mux(meta_tlb_rsp_state, aligned_meta_vaddr, reg_save.address)
+    val tlb_check_vaddr = Mux(meta_tlb_rsp_state, aligned_meta_vaddr, aligned_vaddr)
     assert(io.from_l2TLB.bits.paddr(SV32.offsetLen - 1, 0) ===
            tlb_check_vaddr(SV32.offsetLen - 1, 0),
       "TLB paddr page offset mismatch with vaddr")
@@ -727,7 +732,14 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       when(io.to_tempmem_inst.fire) { state := s_l2cache_tag }
     }
     is(s_l2cache_tag) {
-      when(io.to_tempmem_tag.fire) { state := s_tlb_req }
+      when(io.to_tempmem_tag.fire) {
+        when(io.tag_reuse_hit) {
+          when(complete_address) { state := s_idle }
+            .otherwise { state := s_l2cache_tag }
+        }.otherwise {
+          state := s_tlb_req
+        }
+      }
     }
     is(s_tlb_req) {
       when(io.to_l2TLB.fire) { state := s_tlb_rsp }
@@ -817,6 +829,43 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
     is(s_l2cache_tag) {
       when(io.to_tempmem_tag.fire) {
         tag_mem_index_reg := io.tag_mem_index
+        when(io.tag_reuse_hit) {
+          reg_save.address := address_next
+          when(tensor_copy_mode) {
+            when(!tensor_row_has_next_line) {
+              (0 until 5).foreach { x =>
+                tensor_dim_step_reg(x) := tensor_dim_step_next(x)
+                tensor_dim_pos_reg(x) := tensor_dim_pos_next(x)
+                tensor_global_pos_reg(x) := tensor_global_pos_next(x)
+                tensor_dim_offset_reg(x) := tensor_dim_offset_next(x)
+                tensor_shared_offset_reg(x) := tensor_shared_offset_next(x)
+              }
+              when(tensor_has_next_row) {
+                tensor_row_base_reg := tensor_next_row_base
+                tensor_shared_row_base_reg := tensor_next_shared_row_base
+                when(!tensor_interleave_mode || !tensor_advance_dim_oh(0)) {
+                  tensor_swizzle_row_low_reg := tensor_swizzle_row_low_reg + 1.U
+                }
+              }
+            }
+          }
+          when(complete_address) {
+            (0 until 5).foreach { x =>
+              tensor_dim_step_reg(x) := 0.U
+              tensor_dim_pos_reg(x) := 0.U
+              tensor_base_global_pos_reg(x) := 0.U
+              tensor_global_pos_reg(x) := 0.U
+              tensor_dim_offset_reg(x) := 0.U
+              tensor_shared_offset_reg(x) := 0.U
+            }
+            tensor_row_base_reg := 0.U
+            tensor_shared_row_base_reg := 0.U
+            tensor_dim0_offset_bytes_reg := 0.U
+            tensor_row_span_bytes_reg := 0.U
+            tensor_copy_size_reg := 0.U
+            tensor_swizzle_row_low_reg := 0.U
+          }
+        }
       }
     }
     is(s_l2cache) {
@@ -874,6 +923,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
     val tag_mem_index = Output(UInt(log2Ceil(max_dma_tag).W))
     val from_l2cache = Flipped(DecoupledIO(new DCacheMemRsp))
     val from_shared = Flipped(DecoupledIO(new DCacheCoreRsp_np))
+    val from_addr_tag_reuse = Output(Bool())
     val to_shared = DecoupledIO(new DmaTempOutput)
     val inst_complete = DecoupledIO(UInt(32.W))
   })
@@ -888,12 +938,14 @@ class Temp_mem(implicit p: Parameters) extends Module {
     io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag))
   )
   from_l2cache_all.cacheline_info.tag := tagmem_read_entry.tag
+  from_l2cache_all.cacheline_info.inst_index := tagmem_read_entry.inst_index
   from_l2cache_all.cacheline_info.tensor_dim0_start := tagmem_read_entry.tensor_dim0_start
   from_l2cache_all.cacheline_info.box_dim0_start := tagmem_read_entry.box_dim0_start
   from_l2cache_all.cacheline_info.tensor_high_dim_valid := tagmem_read_entry.tensor_high_dim_valid
   from_l2cache_all.cacheline_info.shared_row_base := tagmem_read_entry.shared_row_base
   from_l2cache_all.cacheline_info.dim0_stride_bytes := tagmem_read_entry.dim0_stride_bytes
   from_l2cache_all.cacheline_info.swizzle_row_low := tagmem_read_entry.swizzle_row_low
+  from_l2cache_all.cacheline_info.tensor_copy := tagmem_read_entry.tensor_copy
   from_l2cache_all.cacheline_info.tensor_interleave := tagmem_read_entry.tensor_interleave
   from_l2cache_all.cacheline_info.tensor_elem_valid := tagmem_read_entry.tensor_elem_valid
   from_l2cache_all.cacheline_info.tensor_elem_addr := tagmem_read_entry.tensor_elem_addr
@@ -920,6 +972,14 @@ class Temp_mem(implicit p: Parameters) extends Module {
     l1cache_sourceBits - log2Ceil(max_dma_tag) - log2Ceil(max_dma_inst)
   )
   val current_inst_entry_index_reg = RegInit(0.U(log2Ceil(max_dma_inst).W))
+
+  val tensorReuseEntries = 32
+  val tensorReuseValid = RegInit(VecInit(Seq.fill(tensorReuseEntries)(false.B)))
+  val tensorReuseTag = RegInit(VecInit(Seq.fill(tensorReuseEntries)(0.U(xLen.W))))
+  val tensorReuseRsp = Reg(Vec(tensorReuseEntries, new DCacheMemRsp))
+  val tensorReuseReplace = RegInit(0.U(log2Ceil(tensorReuseEntries).W))
+  val tensorPendingValid = RegInit(VecInit(Seq.fill(max_dma_tag)(false.B)))
+  val tensorPendingTag = RegInit(VecInit(Seq.fill(max_dma_tag)(0.U(xLen.W))))
 
   // Mask for slicing L2 cacheline into shared-mem groups
   val mask_l2cache = RegInit(VecInit(Seq.fill(numgroupl2cache)(false.B)))
@@ -1033,22 +1093,47 @@ class Temp_mem(implicit p: Parameters) extends Module {
   val s_idle :: s_getdata :: s_shared :: s_shared1 :: s_reset :: Nil = Enum(5)
   val state = RegInit(s_idle)
 
+  val nonInterleaveTensorTag = io.from_addr_tag.bits.tensor_copy &&
+    !io.from_addr_tag.bits.tensor_interleave
+  val tensorReuseHitVec = VecInit((0 until tensorReuseEntries).map { i =>
+    nonInterleaveTensorTag &&
+      tensorReuseValid(i) &&
+      tensorReuseTag(i) === io.from_addr_tag.bits.tag
+  })
+  val tensorReuseHit = tensorReuseHitVec.asUInt.orR
+  val tensorReuseHitIdx = PriorityEncoder(tensorReuseHitVec.asUInt)
+  val tensorPendingHitVec = VecInit((0 until max_dma_tag).map { i =>
+    tensorPendingValid(i) &&
+      tensorPendingTag(i) === io.from_addr_tag.bits.tag
+  })
+  val tensorPendingHit = nonInterleaveTensorTag &&
+    tensorPendingHitVec.asUInt.orR
+  val tensorReuseReady = tensorReuseHit && !used_cache.andR && !io.from_l2cache.fire &&
+    state =/= s_shared1 && state =/= s_reset
+  val tensorReuseFire = io.from_addr_tag.fire && tensorReuseHit
+  val normalTagFire = io.from_addr_tag.fire && !tensorReuseHit
+  val tensorReplayLine = Wire(new DmaL2CachelineInfo)
+  tensorReplayLine.base := tensorReuseRsp(tensorReuseHitIdx)
+  tensorReplayLine.cacheline_info := io.from_addr_tag.bits
+
   io.from_l2cache.ready := !used_cache.andR && (state === s_idle || state === s_getdata)
   io.from_shared.ready := !io.from_addr.fire && state =/= s_reset
   io.from_addr.ready := state === s_idle && !used_inst.andR
-  // Interleave G2S currently issues one 4B tensor element per L2 Get. Multiple
-  // outstanding Gets to the same 128B line can alias in the current cache/GVM
-  // response path, so keep this narrow path serialized while preserving the
-  // existing multi-line overlap for linear and non-interleave tensor copies.
+  // Non-interleave TMA rows often share one L2 cacheline. Reuse returned lines,
+  // stall only if the same line is still pending, and otherwise allow different
+  // lines to stay outstanding. Interleave remains serialized because it issues
+  // many element-sized requests to the same line.
   val interleaveTagSerialBusy = (state =/= s_idle) || used_tag.orR || used_cache.orR
-  io.from_addr_tag.ready := !used_tag.andR && !io.from_l2cache.fire &&
+  val normalTagReady = !used_tag.andR && !io.from_l2cache.fire && !tensorPendingHit &&
     !(io.from_addr_tag.bits.tensor_interleave && interleaveTagSerialBusy)
+  io.from_addr_tag.ready := Mux(tensorReuseHit, tensorReuseReady, normalTagReady)
+  io.from_addr_tag_reuse := tensorReuseHit
 
   // Design invariant assertions: entry allocation must never fire when slots are full
   when(!reset.asBool) {
     assert(!(io.from_addr.fire && used_inst.andR),
       "DMA Temp_mem: inst entry allocated when all slots full")
-    assert(!(io.from_addr_tag.fire && used_tag.andR),
+    assert(!(normalTagFire && used_tag.andR),
       "DMA Temp_mem: tag entry allocated when all tag slots full")
     assert(!(io.from_l2cache.fire && used_cache.andR),
       "DMA Temp_mem: data entry allocated when all cache slots full")
@@ -1060,6 +1145,10 @@ class Temp_mem(implicit p: Parameters) extends Module {
 
   // finish_cnt update on inst arrival
   when(io.from_addr.fire) {
+    when(!(io.from_addr.bits.funct === 2.U &&
+        io.from_addr.bits.tensorvars.interleaveMode === 0.U)) {
+      tensorReuseValid := VecInit(Seq.fill(tensorReuseEntries)(false.B))
+    }
     // BULK copysize must be aligned to dma_aligned_bulk (4 bytes)
     when(!reset.asBool && io.from_addr.bits.funct === 1.U) {
       assert(io.from_addr.bits.copysize(log2Ceil(dma_aligned_bulk) - 1, 0) === 0.U,
@@ -1125,10 +1214,40 @@ class Temp_mem(implicit p: Parameters) extends Module {
         used_tag := used_tag.bitSet(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag)), false.B)
         datamem.write(valid_data_entry, from_l2cache_all)
         entry_index_reg(valid_data_entry) := current_inst_entry_index
+        when(tagmem_read_entry.tensor_copy && !tagmem_read_entry.tensor_interleave) {
+          val reuseHitVec = VecInit((0 until tensorReuseEntries).map { i =>
+            tensorReuseValid(i) && tensorReuseTag(i) === tagmem_read_entry.tag
+          })
+          val reuseInvalidVec = VecInit((0 until tensorReuseEntries).map(i => !tensorReuseValid(i)))
+          val reuseWriteIdx = Mux(
+            reuseHitVec.asUInt.orR,
+            PriorityEncoder(reuseHitVec.asUInt),
+            Mux(reuseInvalidVec.asUInt.orR, PriorityEncoder(reuseInvalidVec.asUInt), tensorReuseReplace)
+          )
+          tensorReuseValid(reuseWriteIdx) := true.B
+          tensorReuseTag(reuseWriteIdx) := tagmem_read_entry.tag
+          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits
+          when(!reuseHitVec.asUInt.orR && !reuseInvalidVec.asUInt.orR) {
+            tensorReuseReplace := Mux(
+              tensorReuseReplace === (tensorReuseEntries - 1).U,
+              0.U,
+              tensorReuseReplace + 1.U
+            )
+          }
+          tensorPendingValid(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag))) := false.B
+        }
       }
-      when(io.from_addr_tag.fire) {
+      when(tensorReuseFire) {
+        used_cache := used_cache.bitSet(valid_data_entry, true.B)
+        datamem.write(valid_data_entry, tensorReplayLine)
+        entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
+      }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
         tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+        when(nonInterleaveTensorTag) {
+          tensorPendingValid(valid_tag_entry) := true.B
+          tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
+        }
       }
       when(io.to_shared.ready && used_cache.orR && !io.from_l2cache.fire) {
         output_data := datamem.read(PriorityEncoder(used_cache))
@@ -1206,19 +1325,57 @@ class Temp_mem(implicit p: Parameters) extends Module {
         used_tag := used_tag.bitSet(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag)), false.B)
         datamem.write(valid_data_entry, from_l2cache_all)
         entry_index_reg(valid_data_entry) := current_inst_entry_index
+        when(tagmem_read_entry.tensor_copy && !tagmem_read_entry.tensor_interleave) {
+          val reuseHitVec = VecInit((0 until tensorReuseEntries).map { i =>
+            tensorReuseValid(i) && tensorReuseTag(i) === tagmem_read_entry.tag
+          })
+          val reuseInvalidVec = VecInit((0 until tensorReuseEntries).map(i => !tensorReuseValid(i)))
+          val reuseWriteIdx = Mux(
+            reuseHitVec.asUInt.orR,
+            PriorityEncoder(reuseHitVec.asUInt),
+            Mux(reuseInvalidVec.asUInt.orR, PriorityEncoder(reuseInvalidVec.asUInt), tensorReuseReplace)
+          )
+          tensorReuseValid(reuseWriteIdx) := true.B
+          tensorReuseTag(reuseWriteIdx) := tagmem_read_entry.tag
+          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits
+          when(!reuseHitVec.asUInt.orR && !reuseInvalidVec.asUInt.orR) {
+            tensorReuseReplace := Mux(
+              tensorReuseReplace === (tensorReuseEntries - 1).U,
+              0.U,
+              tensorReuseReplace + 1.U
+            )
+          }
+          tensorPendingValid(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag))) := false.B
+        }
       }
-      when(io.from_addr_tag.fire) {
+      when(tensorReuseFire) {
+        used_cache := used_cache.bitSet(valid_data_entry, true.B)
+        datamem.write(valid_data_entry, tensorReplayLine)
+        entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
+      }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
         tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+        when(nonInterleaveTensorTag) {
+          tensorPendingValid(valid_tag_entry) := true.B
+          tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
+        }
       }
     }
     is(s_shared) {
       when(io.to_shared.fire) {
         mask_l2cache := mask_l2cache_next
       }
-      when(io.from_addr_tag.fire) {
+      when(tensorReuseFire) {
+        used_cache := used_cache.bitSet(valid_data_entry, true.B)
+        datamem.write(valid_data_entry, tensorReplayLine)
+        entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
+      }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
         tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+        when(nonInterleaveTensorTag) {
+          tensorPendingValid(valid_tag_entry) := true.B
+          tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
+        }
       }
     }
     is(s_shared1) {
@@ -1227,17 +1384,29 @@ class Temp_mem(implicit p: Parameters) extends Module {
         mask_l2cache := VecInit(Seq.fill(numgroupl2cache)(false.B))
         current_inst_entry_index_reg := 0.U
       }
-      when(io.from_addr_tag.fire) {
+      when(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
         tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+        when(nonInterleaveTensorTag) {
+          tensorPendingValid(valid_tag_entry) := true.B
+          tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
+        }
       }
     }
     is(s_reset) {
       used_inst := used_inst.bitSet(complete_inst_entry, false.B)
       finish_cnt(PriorityEncoder(complete)) := 1.U
-      when(io.from_addr_tag.fire) {
+      when(!(output_inst.funct === 2.U &&
+          output_inst.tensorvars.interleaveMode === 0.U)) {
+        tensorReuseValid := VecInit(Seq.fill(tensorReuseEntries)(false.B))
+      }
+      when(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
         tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+        when(nonInterleaveTensorTag) {
+          tensorPendingValid(valid_tag_entry) := true.B
+          tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
+        }
       }
     }
   }
@@ -1254,6 +1423,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
   )
   io.to_shared.bits.instinfo := output_inst
   io.to_shared.bits.cacheline_info.tag := tag_wire + mask_index * dma_aligned_bulk.U
+  io.to_shared.bits.cacheline_info.inst_index := output_data.cacheline_info.inst_index
   io.to_shared.bits.cacheline_info.tensor_dim0_start := output_data.cacheline_info.tensor_dim0_start
   io.to_shared.bits.cacheline_info.tensor_dim_step := output_data.cacheline_info.tensor_dim_step
   io.to_shared.bits.cacheline_info.box_dim0_start := output_data.cacheline_info.box_dim0_start
@@ -1261,6 +1431,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
   io.to_shared.bits.cacheline_info.shared_row_base := output_data.cacheline_info.shared_row_base
   io.to_shared.bits.cacheline_info.dim0_stride_bytes := output_data.cacheline_info.dim0_stride_bytes
   io.to_shared.bits.cacheline_info.swizzle_row_low := output_data.cacheline_info.swizzle_row_low
+  io.to_shared.bits.cacheline_info.tensor_copy := output_data.cacheline_info.tensor_copy
   io.to_shared.bits.cacheline_info.tensor_interleave := output_data.cacheline_info.tensor_interleave
   io.to_shared.bits.cacheline_info.tensor_elem_valid := output_data.cacheline_info.tensor_elem_valid
   io.to_shared.bits.cacheline_info.tensor_elem_addr := output_data.cacheline_info.tensor_elem_addr
@@ -1334,11 +1505,16 @@ class Addrcalc_shared extends Module {
     }
   }
 
-  val current_tag = Wire(UInt(dcache_TagBits.W))
-  val setIdx = Wire(UInt(dcache_SetIdxBits.W))
+  val sharedSetIdxBits = log2Ceil(sharedmem_depth)
+  val sharedSetIdxHi = sharedSetIdxBits + dcache_BlockOffsetBits + dcache_WordOffsetBits - 1
+  val sharedSetIdxLo = dcache_BlockOffsetBits + dcache_WordOffsetBits
+  val sharedTagBits = xLen - sharedSetIdxBits - dcache_BlockOffsetBits - dcache_WordOffsetBits
+
+  val current_tag = Wire(UInt(sharedTagBits.W))
+  val setIdx = Wire(UInt(sharedSetIdxBits.W))
   val first_valid_addr = addr(PriorityEncoder(reg_save.mask.asUInt))
-  current_tag := Mux(reg_save.mask.asUInt.orR, first_valid_addr(xLen - 1, xLen - dcache_TagBits), 0.U)
-  setIdx := Mux(reg_save.mask.asUInt.orR, first_valid_addr(xLen - 1 - dcache_TagBits, xLen - dcache_TagBits - dcache_SetIdxBits), 0.U)
+  current_tag := Mux(reg_save.mask.asUInt.orR, first_valid_addr(xLen - 1, sharedSetIdxHi + 1), 0.U)
+  setIdx := Mux(reg_save.mask.asUInt.orR, first_valid_addr(sharedSetIdxHi, sharedSetIdxLo), 0.U)
 
   val blockOffset = Wire(Vec(numgroupshared, UInt(dcache_BlockOffsetBits.W)))
   (0 until numgroupshared).foreach(x => blockOffset(x) := addr(x)(dcache_BlockOffsetBits + dcache_WordOffsetBits - 1, dcache_WordOffsetBits))
@@ -1346,8 +1522,8 @@ class Addrcalc_shared extends Module {
   val current_mask = Wire(Vec(numgroupshared, Bool()))
   (0 until numgroupshared).foreach(x =>
     current_mask(x) := reg_save.mask(x) &&
-      (addr(x)(xLen - 1, xLen - dcache_TagBits) === current_tag) &&
-      (addr(x)(xLen - 1 - dcache_TagBits, xLen - dcache_TagBits - dcache_SetIdxBits) === setIdx)
+      (addr(x)(xLen - 1, sharedSetIdxHi + 1) === current_tag) &&
+      (addr(x)(sharedSetIdxHi, sharedSetIdxLo) === setIdx)
   )
   val mask_next = Wire(Vec(numgroupshared, Bool()))
   (0 until numgroupshared).foreach(x =>
@@ -1466,6 +1642,7 @@ class DMA_core(implicit p: Parameters) extends Module {
   val tempmem = Module(new Temp_mem)
   tempmem.io.from_addr <> addrCalc_l2cache.io.to_tempmem_inst
   tempmem.io.from_addr_tag <> addrCalc_l2cache.io.to_tempmem_tag
+  addrCalc_l2cache.io.tag_reuse_hit := tempmem.io.from_addr_tag_reuse
   addrCalc_l2cache.io.inst_mem_index := tempmem.io.inst_mem_index
   addrCalc_l2cache.io.tag_mem_index := tempmem.io.tag_mem_index
 
