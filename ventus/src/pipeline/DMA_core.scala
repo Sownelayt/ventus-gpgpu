@@ -90,6 +90,7 @@ class DmaCachelineInfo extends Bundle {
   val tensor_high_dim_valid = Bool()
   val shared_row_base   = UInt(xLen.W)
   val dim0_stride_bytes = UInt(xLen.W)
+  val dim0_phase        = UInt(xLen.W)
   val swizzle_row_low   = UInt(3.W)
   val tensor_copy       = Bool()
   val tensor_interleave = Bool()
@@ -109,8 +110,18 @@ class DmaTempOutput extends Bundle {
   val entry_index = UInt(log2Ceil(max_dma_inst).W)
   val mask = Vec(numgroupshared, Bool())
   val data = Vec(numgroupshared, UInt((dma_aligned_bulk * BitsOfByte).W))
-  val cacheline_info = new DmaCachelineInfo
-  val instinfo = new vExeDataDMA
+  val tag = UInt(xLen.W)
+  val box_dim0_start = UInt(xLen.W)
+  val shared_row_base = UInt(xLen.W)
+  val swizzle_row_low = UInt(3.W)
+  val tensor_interleave = Bool()
+  val shared_elem_addr = UInt(xLen.W)
+  val inst_src = UInt(xLen.W)
+  val inst_dst = UInt(xLen.W)
+  val inst_funct = UInt(4.W)
+  val tensor_datawidth = UInt(4.W)
+  val tensor_element_stride0 = UInt(xLen.W)
+  val tensor_swizzle_mode = UInt(log2Ceil(4).W)
 }
 
 // ============================================================
@@ -211,6 +222,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   val tensor_row_span_bytes_reg = RegInit(0.U(xLen.W))
   val tensor_copy_size_reg = RegInit(0.U(xLen.W))
   val tensor_swizzle_row_low_reg = RegInit(0.U(3.W))
+  val tensor_dim0_phase_reg = RegInit(0.U(xLen.W))
   val tensor_dim_step_next = Wire(Vec(5, UInt(xLen.W)))
   val tensor_dim_pos_next = Wire(Vec(5, UInt(xLen.W)))
   val tensor_global_pos_next = Wire(Vec(5, UInt(xLen.W)))
@@ -262,9 +274,13 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       coords(4) * byteStride(4)
 
     val sliceBytes = Mux(interleaveMode === 1.U, 16.U(xLen.W), 32.U(xLen.W))
-    val channelsPerSlice = Mux(datawidth === 0.U, 1.U, sliceBytes / datawidth)
-    val cSlice = Mux(channelsPerSlice === 0.U, 0.U, coords(0) / channelsPerSlice)
-    val cInSlice = Mux(channelsPerSlice === 0.U, 0.U, coords(0) % channelsPerSlice)
+    // Interleave mode is validated to 4-byte elements in s_tensor_setup.
+    val cSlice = Mux(interleaveMode === 1.U, coords(0) >> 2, coords(0) >> 3)
+    val cInSlice = Mux(
+      interleaveMode === 1.U,
+      coords(0)(1, 0).pad(xLen),
+      coords(0)(2, 0).pad(xLen)
+    )
     val cSliceStride = Wire(UInt(xLen.W))
     cSliceStride := sliceBytes
     when(rank === 3.U) { cSliceStride := byteStride(1) * globalDim(1) }
@@ -272,7 +288,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       .elsewhen(rank === 5.U) { cSliceStride := byteStride(3) * globalDim(3) }
 
     val interleaved = base +
-      cInSlice * datawidth +
+      cInSlice * dma_aligned_bulk.U(xLen.W) +
       cSlice * cSliceStride +
       coords(1) * byteStride(1) +
       coords(2) * byteStride(2) +
@@ -322,14 +338,14 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   // below then advances with registered offsets and adders instead of repeated
   // per-cacheline div/mod/multiply chains.
   val box_elements_num_setup = Wire(Vec(5, UInt(xLen.W)))
-  (0 until 5).foreach { x =>
+  box_elements_num_setup(0) := tvars.boxDim(0)
+  (1 until 5).foreach { x =>
     box_elements_num_setup(x) := Mux(
-      tvars.elementStrides(x) === 0.U,
-      0.U,
+      tvars.elementStrides(x) <= 1.U,
+      tvars.boxDim(x),
       (tvars.boxDim(x) + tvars.elementStrides(x) - 1.U) / tvars.elementStrides(x)
     )
   }
-  box_elements_num_setup(0) := tvars.boxDim(0)
 
   val tensor_dim_stride_bytes_setup = Wire(Vec(5, UInt(xLen.W)))
   tensor_dim_stride_bytes_setup(0) := tvars.elementStrides(0) * tvars.datawidth
@@ -354,55 +370,37 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
     is(5.U) { Tensorcopysize := tensor_shared_stride_bytes_setup(4) * box_elements_num_setup(4) }
   }
 
-  val box_to_global_offset = tvars.BoxAddress - tvars.globalAddress
-  val box_dim0_offset_bytes_setup = Wire(UInt(xLen.W))
-  box_dim0_offset_bytes_setup := box_to_global_offset
-  when(tvars.tensorRank > 1.U && tvars.globalStrides(0) =/= 0.U) {
-    box_dim0_offset_bytes_setup := box_to_global_offset % tvars.globalStrides(0)
-  }
-
+  // BoxAddress is computed directly from desc_coords above, so keep the
+  // original logical coordinates instead of reconstructing them with div/mod.
+  val box_dim0_offset_bytes_setup = desc_coords(0) * desc_byte_stride(0)
   val box_offset_elems_setup = Wire(Vec(5, UInt(xLen.W)))
-  (0 until 5).foreach { x => box_offset_elems_setup(x) := 0.U }
-
-  val box_offset_rem4 = box_to_global_offset
-  val box_offset_rem3 = Wire(UInt(xLen.W))
-  box_offset_rem3 := box_offset_rem4
-  when(tvars.tensorRank > 4.U && tvars.globalStrides(3) =/= 0.U) {
-    box_offset_elems_setup(4) := box_offset_rem4 / tvars.globalStrides(3)
-    box_offset_rem3 := box_offset_rem4 % tvars.globalStrides(3)
-  }
-
-  val box_offset_rem2 = Wire(UInt(xLen.W))
-  box_offset_rem2 := box_offset_rem3
-  when(tvars.tensorRank > 3.U && tvars.globalStrides(2) =/= 0.U) {
-    box_offset_elems_setup(3) := box_offset_rem3 / tvars.globalStrides(2)
-    box_offset_rem2 := box_offset_rem3 % tvars.globalStrides(2)
-  }
-
-  val box_offset_rem1 = Wire(UInt(xLen.W))
-  box_offset_rem1 := box_offset_rem2
-  when(tvars.tensorRank > 2.U && tvars.globalStrides(1) =/= 0.U) {
-    box_offset_elems_setup(2) := box_offset_rem2 / tvars.globalStrides(1)
-    box_offset_rem1 := box_offset_rem2 % tvars.globalStrides(1)
-  }
-
-  val box_offset_rem0 = Wire(UInt(xLen.W))
-  box_offset_rem0 := box_offset_rem1
-  when(tvars.tensorRank > 1.U && tvars.globalStrides(0) =/= 0.U) {
-    box_offset_elems_setup(1) := box_offset_rem1 / tvars.globalStrides(0)
-    box_offset_rem0 := box_offset_rem1 % tvars.globalStrides(0)
-  }
-  when(tvars.datawidth =/= 0.U) {
-    box_offset_elems_setup(0) := box_offset_rem0 / tvars.datawidth
-  }
-  when(tvars.interleaveMode =/= 0.U) {
-    (0 until 5).foreach { x => box_offset_elems_setup(x) := desc_coords(x) }
-  }
+  (0 until 5).foreach { x => box_offset_elems_setup(x) := desc_coords(x) }
 
   val tensor_high_dim_valid_terms = (1 until 5).map { d =>
     (tvars.tensorRank <= d.U) || (tensor_global_pos_reg(d) < tvars.globalDim(d))
   }
   val tensor_high_dim_valid = tensor_high_dim_valid_terms.reduce(_ && _)
+
+  def advanceTensorDim0PhaseByGroup(phase: UInt, stride: UInt): UInt = {
+    val width = xLen + 1
+    val inc = phase.pad(width) + dma_aligned_bulk.U(width.W)
+    val strideWide = stride.pad(width)
+    val next = Mux(inc >= strideWide, inc - strideWide, inc)
+    next(xLen - 1, 0)
+  }
+
+  def advanceTensorDim0PhaseByGroups(phase: UInt, stride: UInt, groups: UInt): UInt = {
+    val phases = Wire(Vec(numgroupl2cache + 1, UInt(xLen.W)))
+    phases(0) := phase
+    (0 until numgroupl2cache).foreach { i =>
+      phases(i + 1) := Mux(
+        i.U < groups,
+        advanceTensorDim0PhaseByGroup(phases(i), stride),
+        phases(i)
+      )
+    }
+    phases(numgroupl2cache)
+  }
 
   val box_dim0_start = tensor_row_base_reg
   val tensor_dim0_row_start = tensor_row_base_reg - tensor_dim0_offset_bytes_reg
@@ -507,6 +505,23 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   val tensor_row_has_next_line = !tensor_interleave_mode && ((reg_save.address + l2cacheline.U) < box_dim0_end)
   val address_next = Wire(UInt(xLen.W))
   address_next := reg_save.address + l2cacheline.U
+  val tensor_line_phase_advance_bytes = Wire(UInt((log2Ceil(l2cacheline + 1) + 1).W))
+  tensor_line_phase_advance_bytes := l2cacheline.U
+  when(reg_save.address < box_dim0_start) {
+    tensor_line_phase_advance_bytes := (reg_save.address + l2cacheline.U - box_dim0_start)(log2Ceil(l2cacheline + 1), 0)
+  }
+  val tensor_line_phase_advance_groups =
+    tensor_line_phase_advance_bytes >> log2Ceil(dma_aligned_bulk)
+  val tensor_dim0_phase_next_line_raw = advanceTensorDim0PhaseByGroups(
+    tensor_dim0_phase_reg,
+    tensor_dim_stride_bytes_reg(0),
+    tensor_line_phase_advance_groups
+  )
+  val tensor_dim0_phase_next_line = Mux(
+    !tensor_interleave_mode && tvars.datawidth === dma_aligned_bulk.U && tvars.elementStrides(0) > 1.U,
+    tensor_dim0_phase_next_line_raw,
+    0.U
+  )
   when(tensor_copy_mode) {
     when(tensor_row_has_next_line) {
       address_next := reg_save.address + l2cacheline.U
@@ -549,6 +564,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
   io.to_tempmem_tag.bits.tensor_high_dim_valid := tensor_high_dim_valid
   io.to_tempmem_tag.bits.shared_row_base := tensor_shared_row_base_reg
   io.to_tempmem_tag.bits.dim0_stride_bytes := tensor_dim_stride_bytes_reg(0)
+  io.to_tempmem_tag.bits.dim0_phase := tensor_dim0_phase_reg
   io.to_tempmem_tag.bits.swizzle_row_low := tensor_swizzle_row_low_reg
   io.to_tempmem_tag.bits.tensor_copy := tensor_copy_mode
   io.to_tempmem_tag.bits.tensor_interleave := tensor_interleave_mode
@@ -792,6 +808,10 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
           assert(tvars.datawidth === dma_aligned_bulk.U,
             "DMA TMA interleave v0 supports only 4-byte elements")
         }
+        when(tvars.elementStrides(0) > 1.U) {
+          assert(tvars.datawidth === dma_aligned_bulk.U,
+            "DMA TMA dim0 elementStride v0 supports only 4-byte elements")
+        }
         assert(desc_ptr_reg(log2Ceil(l2cacheline) - 1, 0) === 0.U,
           "DMA descriptor TMA requires 128B-aligned descriptor in v0")
       }
@@ -808,6 +828,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       tensor_row_base_reg := tvars.BoxAddress
       tensor_shared_row_base_reg := reg_save.in3(0)
       tensor_dim0_offset_bytes_reg := Mux(tensor_interleave_mode, 0.U, box_dim0_offset_bytes_setup)
+      tensor_dim0_phase_reg := 0.U
       tensor_row_span_bytes_reg := Mux(
         tensor_interleave_mode,
         tvars.datawidth,
@@ -832,7 +853,9 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
         when(io.tag_reuse_hit) {
           reg_save.address := address_next
           when(tensor_copy_mode) {
-            when(!tensor_row_has_next_line) {
+            when(tensor_row_has_next_line) {
+              tensor_dim0_phase_reg := tensor_dim0_phase_next_line
+            }.otherwise {
               (0 until 5).foreach { x =>
                 tensor_dim_step_reg(x) := tensor_dim_step_next(x)
                 tensor_dim_pos_reg(x) := tensor_dim_pos_next(x)
@@ -843,6 +866,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
               when(tensor_has_next_row) {
                 tensor_row_base_reg := tensor_next_row_base
                 tensor_shared_row_base_reg := tensor_next_shared_row_base
+                tensor_dim0_phase_reg := 0.U
                 when(!tensor_interleave_mode || !tensor_advance_dim_oh(0)) {
                   tensor_swizzle_row_low_reg := tensor_swizzle_row_low_reg + 1.U
                 }
@@ -861,6 +885,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
             tensor_row_base_reg := 0.U
             tensor_shared_row_base_reg := 0.U
             tensor_dim0_offset_bytes_reg := 0.U
+            tensor_dim0_phase_reg := 0.U
             tensor_row_span_bytes_reg := 0.U
             tensor_copy_size_reg := 0.U
             tensor_swizzle_row_low_reg := 0.U
@@ -872,7 +897,9 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
       when(io.to_l2cache.fire) {
         reg_save.address := address_next
         when(tensor_copy_mode) {
-          when(!tensor_row_has_next_line) {
+          when(tensor_row_has_next_line) {
+            tensor_dim0_phase_reg := tensor_dim0_phase_next_line
+          }.otherwise {
             (0 until 5).foreach { x =>
               tensor_dim_step_reg(x) := tensor_dim_step_next(x)
               tensor_dim_pos_reg(x) := tensor_dim_pos_next(x)
@@ -883,6 +910,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
             when(tensor_has_next_row) {
               tensor_row_base_reg := tensor_next_row_base
               tensor_shared_row_base_reg := tensor_next_shared_row_base
+              tensor_dim0_phase_reg := 0.U
               when(!tensor_interleave_mode || !tensor_advance_dim_oh(0)) {
                 tensor_swizzle_row_low_reg := tensor_swizzle_row_low_reg + 1.U
               }
@@ -902,6 +930,7 @@ class AddrCalc_l2cache(implicit p: Parameters) extends Module {
           tensor_row_base_reg := 0.U
           tensor_shared_row_base_reg := 0.U
           tensor_dim0_offset_bytes_reg := 0.U
+          tensor_dim0_phase_reg := 0.U
           tensor_row_span_bytes_reg := 0.U
           tensor_copy_size_reg := 0.U
           tensor_swizzle_row_low_reg := 0.U
@@ -944,6 +973,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
   from_l2cache_all.cacheline_info.tensor_high_dim_valid := tagmem_read_entry.tensor_high_dim_valid
   from_l2cache_all.cacheline_info.shared_row_base := tagmem_read_entry.shared_row_base
   from_l2cache_all.cacheline_info.dim0_stride_bytes := tagmem_read_entry.dim0_stride_bytes
+  from_l2cache_all.cacheline_info.dim0_phase := tagmem_read_entry.dim0_phase
   from_l2cache_all.cacheline_info.swizzle_row_low := tagmem_read_entry.swizzle_row_low
   from_l2cache_all.cacheline_info.tensor_copy := tagmem_read_entry.tensor_copy
   from_l2cache_all.cacheline_info.tensor_interleave := tagmem_read_entry.tensor_interleave
@@ -973,26 +1003,36 @@ class Temp_mem(implicit p: Parameters) extends Module {
   )
   val current_inst_entry_index_reg = RegInit(0.U(log2Ceil(max_dma_inst).W))
 
-  val tensorReuseEntries = 32
+  val tensorReuseEntries = 8
   val tensorReuseValid = RegInit(VecInit(Seq.fill(tensorReuseEntries)(false.B)))
   val tensorReuseTag = RegInit(VecInit(Seq.fill(tensorReuseEntries)(0.U(xLen.W))))
-  val tensorReuseRsp = Reg(Vec(tensorReuseEntries, new DCacheMemRsp))
+  val tensorReuseRsp = Reg(Vec(tensorReuseEntries, Vec(dcache_BlockWords, UInt(xLen.W))))
   val tensorReuseReplace = RegInit(0.U(log2Ceil(tensorReuseEntries).W))
   val tensorPendingValid = RegInit(VecInit(Seq.fill(max_dma_tag)(false.B)))
   val tensorPendingTag = RegInit(VecInit(Seq.fill(max_dma_tag)(0.U(xLen.W))))
 
   // Mask for slicing L2 cacheline into shared-mem groups
   val mask_l2cache = RegInit(VecInit(Seq.fill(numgroupl2cache)(false.B)))
-  val mask_index = PriorityEncoder(mask_l2cache)
+  val mask_index =
+    if (numgroupshared == numgroupl2cache) 0.U(log2Ceil(numgroupl2cache).W)
+    else PriorityEncoder(mask_l2cache)
   val mask_l2cache_next = Wire(Vec(numgroupl2cache, Bool()))
-  (0 until numgroupl2cache).foreach(x =>
-    mask_l2cache_next(x) := mask_l2cache(x) && !(x.U >= mask_index && x.U < mask_index + numgroupshared.U)
-  )
+  if (numgroupshared == numgroupl2cache) {
+    mask_l2cache_next := VecInit(Seq.fill(numgroupl2cache)(false.B))
+  } else {
+    (0 until numgroupl2cache).foreach(x =>
+      mask_l2cache_next(x) := mask_l2cache(x) && !(x.U >= mask_index && x.U < mask_index + numgroupshared.U)
+    )
+  }
   val mask_shared = Wire(Vec(numgroupshared, Bool()))
-  (0 until numgroupshared).foreach(x =>
-    when(x.U + mask_index < numgroupl2cache.U) { mask_shared(x) := mask_l2cache(x.U + mask_index) }
-    .otherwise { mask_shared(x) := false.B }
-  )
+  if (numgroupshared == numgroupl2cache) {
+    (0 until numgroupshared).foreach(x => mask_shared(x) := mask_l2cache(x))
+  } else {
+    (0 until numgroupshared).foreach(x =>
+      when(x.U + mask_index < numgroupl2cache.U) { mask_shared(x) := mask_l2cache(x.U + mask_index) }
+      .otherwise { mask_shared(x) := false.B }
+    )
+  }
 
   val output_inst = Reg(new vExeDataDMA)
   val output_data = Reg(new DmaL2CachelineInfo)
@@ -1035,29 +1075,49 @@ class Temp_mem(implicit p: Parameters) extends Module {
   )
   val t_dim0_end      = t_box_dim0_start + t_dim0_row_span_bytes
   val t_tensor_dim0_end = t_tensor_dim0_start + t_globalDim0 * t_datawidth
+  val t_dim0PhaseWidth = xLen + 1
 
-  def tensorDim0ByteValid(byteAddr: UInt): Bool = {
-    val rel = byteAddr - t_box_dim0_start
-    val in_row_span = (byteAddr >= t_box_dim0_start) && (byteAddr < t_dim0_end)
-    val in_tensor_row = (byteAddr >= t_tensor_dim0_start) && (byteAddr < t_tensor_dim0_end)
-    val is_selected = Mux(
-      t_elementStride0 <= 1.U,
-      true.B,
-      (rel % t_dim0_stride_bytes) < t_datawidth,
-    )
-    in_row_span && in_tensor_row && t_tensor_high_dim_valid && is_selected
+  def advanceDim0PhaseByGroup(phase: UInt, stride: UInt): UInt = {
+    val inc = phase.pad(t_dim0PhaseWidth) + dma_aligned_bulk.U(t_dim0PhaseWidth.W)
+    val strideWide = stride.pad(t_dim0PhaseWidth)
+    val next = Mux(inc >= strideWide, inc - strideWide, inc)
+    next(xLen - 1, 0)
+  }
+
+  val t_supports_dim0_gather = t_datawidth === dma_aligned_bulk.U && t_elementStride0 > 1.U
+  val t_line_dim0_phase = output_data.cacheline_info.dim0_phase
+  val t_group_dim0_phase = Wire(Vec(numgroupl2cache, UInt(xLen.W)))
+  val t_group_dim0_selected = Wire(Vec(numgroupl2cache, Bool()))
+  (0 until numgroupl2cache).foreach { g =>
+    val groupAddr = tag_wire + (g * dma_aligned_bulk).U
+    if (g == 0) {
+      t_group_dim0_phase(g) := Mux(groupAddr === t_box_dim0_start, 0.U, t_line_dim0_phase)
+    } else {
+      t_group_dim0_phase(g) := Mux(
+        groupAddr === t_box_dim0_start,
+        0.U,
+        advanceDim0PhaseByGroup(t_group_dim0_phase(g - 1), t_dim0_stride_bytes)
+      )
+    }
+    t_group_dim0_selected(g) := !t_supports_dim0_gather || (t_group_dim0_phase(g) < dma_aligned_bulk.U)
+  }
+
+  def tensorDim0ElemValid(elemAddr: UInt, group: Int): Bool = {
+    val in_row_span = (elemAddr >= t_box_dim0_start) && (elemAddr < t_dim0_end)
+    val in_tensor_row = (elemAddr >= t_tensor_dim0_start) && (elemAddr < t_tensor_dim0_end)
+    in_row_span && in_tensor_row && t_tensor_high_dim_valid && t_group_dim0_selected(group)
   }
 
   switch(t_datawidth) {
     is(1.U) {
       (0 until l2cacheline).foreach { x =>
-        val in_bounds = tensorDim0ByteValid(tag_wire + x.U)
+        val in_bounds = tensorDim0ElemValid(tag_wire + x.U, x / dma_aligned_bulk)
         when(!in_bounds) { tmp_1(x) := 0.U }
       }
     }
     is(2.U) {
       (0 until l2cacheline by 2).foreach { x =>
-        val in_bounds = tensorDim0ByteValid(tag_wire + x.U)
+        val in_bounds = tensorDim0ElemValid(tag_wire + x.U, x / dma_aligned_bulk)
         when(!in_bounds) {
           val fill_val = Mux(t_dataType === UINT16, 0.U((2 * BitsOfByte).W),
             Mux(t_oobfill.asBool, Fill(2 * BitsOfByte, 1.U), 0.U((2 * BitsOfByte).W)))
@@ -1067,7 +1127,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
     }
     is(4.U) {
       (0 until l2cacheline by 4).foreach { x =>
-        val in_bounds = tensorDim0ByteValid(tag_wire + x.U)
+        val in_bounds = tensorDim0ElemValid(tag_wire + x.U, x / dma_aligned_bulk)
         when(!in_bounds) {
           val is_int = (t_dataType === UINT32) || (t_dataType === INT32)
           val fill_val = Mux(is_int, 0.U((4 * BitsOfByte).W),
@@ -1078,7 +1138,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
     }
     is(8.U) {
       (0 until l2cacheline by 8).foreach { x =>
-        val in_bounds = tensorDim0ByteValid(tag_wire + x.U)
+        val in_bounds = tensorDim0ElemValid(tag_wire + x.U, x / dma_aligned_bulk)
         when(!in_bounds) {
           val is_int = (t_dataType === UINT64) || (t_dataType === INT64)
           val fill_val = Mux(is_int, 0.U((8 * BitsOfByte).W),
@@ -1113,8 +1173,16 @@ class Temp_mem(implicit p: Parameters) extends Module {
   val tensorReuseFire = io.from_addr_tag.fire && tensorReuseHit
   val normalTagFire = io.from_addr_tag.fire && !tensorReuseHit
   val tensorReplayLine = Wire(new DmaL2CachelineInfo)
-  tensorReplayLine.base := tensorReuseRsp(tensorReuseHitIdx)
+  tensorReplayLine.base.d_opcode := 0.U
+  tensorReplayLine.base.d_param := 0.U
+  tensorReplayLine.base.d_source := 0.U
+  tensorReplayLine.base.d_addr := 0.U
+  tensorReplayLine.base.d_data := tensorReuseRsp(tensorReuseHitIdx)
   tensorReplayLine.cacheline_info := io.from_addr_tag.bits
+
+  val dataWriteValid = io.from_l2cache.fire || tensorReuseFire
+  val dataWriteBits = Mux(tensorReuseFire, tensorReplayLine, from_l2cache_all)
+  val tagWriteValid = normalTagFire
 
   io.from_l2cache.ready := !used_cache.andR && (state === s_idle || state === s_getdata)
   io.from_shared.ready := !io.from_addr.fire && state =/= s_reset
@@ -1137,6 +1205,8 @@ class Temp_mem(implicit p: Parameters) extends Module {
       "DMA Temp_mem: tag entry allocated when all tag slots full")
     assert(!(io.from_l2cache.fire && used_cache.andR),
       "DMA Temp_mem: data entry allocated when all cache slots full")
+    assert(!(io.from_l2cache.fire && tensorReuseFire),
+      "DMA Temp_mem: L2 response and tensor replay both attempted a data write")
   }
   io.to_shared.valid := state === s_shared
   io.inst_complete.valid := state === s_reset
@@ -1212,7 +1282,6 @@ class Temp_mem(implicit p: Parameters) extends Module {
       when(io.from_l2cache.fire) {
         used_cache := used_cache.bitSet(valid_data_entry, true.B)
         used_tag := used_tag.bitSet(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag)), false.B)
-        datamem.write(valid_data_entry, from_l2cache_all)
         entry_index_reg(valid_data_entry) := current_inst_entry_index
         when(tagmem_read_entry.tensor_copy && !tagmem_read_entry.tensor_interleave) {
           val reuseHitVec = VecInit((0 until tensorReuseEntries).map { i =>
@@ -1226,7 +1295,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
           )
           tensorReuseValid(reuseWriteIdx) := true.B
           tensorReuseTag(reuseWriteIdx) := tagmem_read_entry.tag
-          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits
+          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits.d_data
           when(!reuseHitVec.asUInt.orR && !reuseInvalidVec.asUInt.orR) {
             tensorReuseReplace := Mux(
               tensorReuseReplace === (tensorReuseEntries - 1).U,
@@ -1239,11 +1308,9 @@ class Temp_mem(implicit p: Parameters) extends Module {
       }
       when(tensorReuseFire) {
         used_cache := used_cache.bitSet(valid_data_entry, true.B)
-        datamem.write(valid_data_entry, tensorReplayLine)
         entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
       }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
-        tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
         when(nonInterleaveTensorTag) {
           tensorPendingValid(valid_tag_entry) := true.B
           tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
@@ -1295,12 +1362,11 @@ class Temp_mem(implicit p: Parameters) extends Module {
           val box_end = box_start + dim0_row_span_bytes
           (0 until numgroupl2cache).foreach { x =>
             val addr_start = tag_wire + (x.U * dma_aligned_bulk.U)
-            val rel = addr_start - box_start
             val in_row_span = (addr_start >= box_start) && (addr_start < box_end)
             val is_selected = Mux(
               elementStride0 <= 1.U,
               true.B,
-              (rel % dim0_stride_bytes) < datawidth,
+              t_group_dim0_selected(x),
             )
             mask_l2cache(x) := in_row_span && is_selected
           }
@@ -1323,7 +1389,6 @@ class Temp_mem(implicit p: Parameters) extends Module {
       when(io.from_l2cache.fire) {
         used_cache := used_cache.bitSet(valid_data_entry, true.B)
         used_tag := used_tag.bitSet(io.from_l2cache.bits.d_source(l1cache_sourceBits - 1, l1cache_sourceBits - log2Ceil(max_dma_tag)), false.B)
-        datamem.write(valid_data_entry, from_l2cache_all)
         entry_index_reg(valid_data_entry) := current_inst_entry_index
         when(tagmem_read_entry.tensor_copy && !tagmem_read_entry.tensor_interleave) {
           val reuseHitVec = VecInit((0 until tensorReuseEntries).map { i =>
@@ -1337,7 +1402,7 @@ class Temp_mem(implicit p: Parameters) extends Module {
           )
           tensorReuseValid(reuseWriteIdx) := true.B
           tensorReuseTag(reuseWriteIdx) := tagmem_read_entry.tag
-          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits
+          tensorReuseRsp(reuseWriteIdx) := io.from_l2cache.bits.d_data
           when(!reuseHitVec.asUInt.orR && !reuseInvalidVec.asUInt.orR) {
             tensorReuseReplace := Mux(
               tensorReuseReplace === (tensorReuseEntries - 1).U,
@@ -1350,11 +1415,9 @@ class Temp_mem(implicit p: Parameters) extends Module {
       }
       when(tensorReuseFire) {
         used_cache := used_cache.bitSet(valid_data_entry, true.B)
-        datamem.write(valid_data_entry, tensorReplayLine)
         entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
       }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
-        tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
         when(nonInterleaveTensorTag) {
           tensorPendingValid(valid_tag_entry) := true.B
           tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
@@ -1367,11 +1430,9 @@ class Temp_mem(implicit p: Parameters) extends Module {
       }
       when(tensorReuseFire) {
         used_cache := used_cache.bitSet(valid_data_entry, true.B)
-        datamem.write(valid_data_entry, tensorReplayLine)
         entry_index_reg(valid_data_entry) := io.from_addr_tag.bits.inst_index
       }.elsewhen(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
-        tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
         when(nonInterleaveTensorTag) {
           tensorPendingValid(valid_tag_entry) := true.B
           tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
@@ -1386,7 +1447,6 @@ class Temp_mem(implicit p: Parameters) extends Module {
       }
       when(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
-        tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
         when(nonInterleaveTensorTag) {
           tensorPendingValid(valid_tag_entry) := true.B
           tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
@@ -1402,7 +1462,6 @@ class Temp_mem(implicit p: Parameters) extends Module {
       }
       when(normalTagFire) {
         used_tag := used_tag.bitSet(valid_tag_entry, true.B)
-        tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
         when(nonInterleaveTensorTag) {
           tensorPendingValid(valid_tag_entry) := true.B
           tensorPendingTag(valid_tag_entry) := io.from_addr_tag.bits.tag
@@ -1411,31 +1470,44 @@ class Temp_mem(implicit p: Parameters) extends Module {
     }
   }
 
+  when(dataWriteValid) {
+    datamem.write(valid_data_entry, dataWriteBits)
+  }
+  when(tagWriteValid) {
+    tagmem.write(valid_tag_entry, io.from_addr_tag.bits)
+  }
+
   // Output to shared
   io.to_shared.bits.entry_index := current_inst_entry_index_reg
   io.to_shared.bits.mask := mask_shared
-  (0 until numgroupshared).foreach(x =>
-    when(x.U + mask_index < numgroupl2cache.U) {
-      io.to_shared.bits.data(x) := output_data_4byte(x.U + mask_index)
-    }.otherwise {
-      io.to_shared.bits.data(x) := 0.U
-    }
-  )
-  io.to_shared.bits.instinfo := output_inst
-  io.to_shared.bits.cacheline_info.tag := tag_wire + mask_index * dma_aligned_bulk.U
-  io.to_shared.bits.cacheline_info.inst_index := output_data.cacheline_info.inst_index
-  io.to_shared.bits.cacheline_info.tensor_dim0_start := output_data.cacheline_info.tensor_dim0_start
-  io.to_shared.bits.cacheline_info.tensor_dim_step := output_data.cacheline_info.tensor_dim_step
-  io.to_shared.bits.cacheline_info.box_dim0_start := output_data.cacheline_info.box_dim0_start
-  io.to_shared.bits.cacheline_info.tensor_high_dim_valid := output_data.cacheline_info.tensor_high_dim_valid
-  io.to_shared.bits.cacheline_info.shared_row_base := output_data.cacheline_info.shared_row_base
-  io.to_shared.bits.cacheline_info.dim0_stride_bytes := output_data.cacheline_info.dim0_stride_bytes
-  io.to_shared.bits.cacheline_info.swizzle_row_low := output_data.cacheline_info.swizzle_row_low
-  io.to_shared.bits.cacheline_info.tensor_copy := output_data.cacheline_info.tensor_copy
-  io.to_shared.bits.cacheline_info.tensor_interleave := output_data.cacheline_info.tensor_interleave
-  io.to_shared.bits.cacheline_info.tensor_elem_valid := output_data.cacheline_info.tensor_elem_valid
-  io.to_shared.bits.cacheline_info.tensor_elem_addr := output_data.cacheline_info.tensor_elem_addr
-  io.to_shared.bits.cacheline_info.shared_elem_addr := output_data.cacheline_info.shared_elem_addr
+  if (numgroupshared == numgroupl2cache) {
+    (0 until numgroupshared).foreach(x =>
+      io.to_shared.bits.data(x) := output_data_4byte(x)
+    )
+  } else {
+    (0 until numgroupshared).foreach(x =>
+      when(x.U + mask_index < numgroupl2cache.U) {
+        io.to_shared.bits.data(x) := output_data_4byte(x.U + mask_index)
+      }.otherwise {
+        io.to_shared.bits.data(x) := 0.U
+      }
+    )
+  }
+  io.to_shared.bits.inst_src := output_inst.src
+  io.to_shared.bits.inst_dst := output_inst.dst
+  io.to_shared.bits.inst_funct := output_inst.funct
+  io.to_shared.bits.tensor_datawidth := output_inst.tensorvars.datawidth
+  io.to_shared.bits.tensor_element_stride0 := output_inst.tensorvars.elementStrides(0)
+  io.to_shared.bits.tensor_swizzle_mode := output_inst.tensorvars.swizzleMode
+  io.to_shared.bits.tag := {
+    if (numgroupshared == numgroupl2cache) tag_wire
+    else tag_wire + mask_index * dma_aligned_bulk.U
+  }
+  io.to_shared.bits.box_dim0_start := output_data.cacheline_info.box_dim0_start
+  io.to_shared.bits.shared_row_base := output_data.cacheline_info.shared_row_base
+  io.to_shared.bits.swizzle_row_low := output_data.cacheline_info.swizzle_row_low
+  io.to_shared.bits.tensor_interleave := output_data.cacheline_info.tensor_interleave
+  io.to_shared.bits.shared_elem_addr := output_data.cacheline_info.shared_elem_addr
   io.inst_complete.bits := output_inst.wid
 
 }
@@ -1469,37 +1541,44 @@ class Addrcalc_shared extends Module {
   val addr = Wire(Vec(numgroupshared, UInt(xLen.W)))
   // Default: linear address calculation
   (0 until numgroupshared).foreach { x =>
-    addr(x) := reg_save.cacheline_info.tag - reg_save.instinfo.src + reg_save.instinfo.dst + (x.U * dma_aligned_bulk.U)
+    addr(x) := reg_save.tag - reg_save.inst_src + reg_save.inst_dst + (x.U * dma_aligned_bulk.U)
   }
-  when(reg_save.instinfo.funct === 2.U) {
-    when(reg_save.cacheline_info.tensor_interleave) {
+  when(reg_save.inst_funct === 2.U) {
+    when(reg_save.tensor_interleave) {
       (0 until numgroupshared).foreach { x =>
         addr(x) := swizzleSharedAddr(
-          reg_save.cacheline_info.shared_elem_addr,
-          reg_save.instinfo.dst,
-          reg_save.instinfo.tensorvars.swizzleMode,
-          reg_save.cacheline_info.swizzle_row_low
+          reg_save.shared_elem_addr,
+          reg_save.inst_dst,
+          reg_save.tensor_swizzle_mode,
+          reg_save.swizzle_row_low
         )
       }
     }.otherwise {
-      val datawidth = reg_save.instinfo.tensorvars.datawidth
+      val datawidth = reg_save.tensor_datawidth
       val supportsPackedDim0Gather =
-        (datawidth === dma_aligned_bulk.U) && (reg_save.instinfo.tensorvars.elementStrides(0) > 1.U)
+        (datawidth === dma_aligned_bulk.U) && (reg_save.tensor_element_stride0 > 1.U)
+      val selectedPrefixWidth = log2Ceil(numgroupshared + 1)
+      val selectedPrefix = Wire(Vec(numgroupshared + 1, UInt(selectedPrefixWidth.W)))
+      selectedPrefix(0) := 0.U
       (0 until numgroupshared).foreach { x =>
-        val srcDim0OffsetBytes = reg_save.cacheline_info.tag - reg_save.cacheline_info.box_dim0_start +
+        val selectedPrefixNext = selectedPrefix(x) + reg_save.mask(x).asUInt
+        selectedPrefix(x + 1) := selectedPrefixNext(selectedPrefixWidth - 1, 0)
+      }
+      (0 until numgroupshared).foreach { x =>
+        val srcDim0OffsetBytes = reg_save.tag - reg_save.box_dim0_start +
           x.U * dma_aligned_bulk.U
-        val selectedBeforeInGroup = if (x == 0) 0.U else PopCount(reg_save.mask.take(x))
+        val selectedBeforeInGroup = selectedPrefix(x)
         val packedDim0OffsetBytes = Mux(
           supportsPackedDim0Gather,
           selectedBeforeInGroup << log2Ceil(dma_aligned_bulk),
           srcDim0OffsetBytes,
         )
-        val logicalAddr = reg_save.cacheline_info.shared_row_base + packedDim0OffsetBytes
+        val logicalAddr = reg_save.shared_row_base + packedDim0OffsetBytes
         addr(x) := swizzleSharedAddr(
           logicalAddr,
-          reg_save.instinfo.dst,
-          reg_save.instinfo.tensorvars.swizzleMode,
-          reg_save.cacheline_info.swizzle_row_low
+          reg_save.inst_dst,
+          reg_save.tensor_swizzle_mode,
+          reg_save.swizzle_row_low
         )
       }
     }

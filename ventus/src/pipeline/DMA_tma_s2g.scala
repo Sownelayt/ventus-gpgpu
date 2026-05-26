@@ -78,7 +78,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val widReg = RegInit(0.U(depth_warp.W))
   val asidReg = RegInit(0.U(SV32.asidLen.W))
   val pAddrReg = RegInit(0.U(SV32.paLen.W))
-  val linReg = RegInit(0.U(xLen.W))
+  val currentIdxReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
   val sharedDataReg = Reg(UInt(xLen.W))
   val descWordsReg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
 
@@ -94,7 +94,6 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val outStrideBytes = Wire(Vec(5, UInt(xLen.W)))
   val outRowStride = Wire(Vec(5, UInt(xLen.W)))
   val currentIdx = Wire(Vec(5, UInt(xLen.W)))
-  val idxRem = Wire(Vec(6, UInt(xLen.W)))
   val currentCoord = Wire(Vec(5, UInt(xLen.W)))
 
   descByteStride(0) := Mux(descWordsReg(9) === 0.U, tensorDataWidth(descControl(3, 0)), descWordsReg(9))
@@ -119,9 +118,13 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
       logicalCoord(4) * byteStride(4)
 
     val sliceBytes = Mux(interleaveMode === 1.U, 16.U(xLen.W), 32.U(xLen.W))
-    val channelsPerSlice = Mux(datawidth === 0.U, 1.U, sliceBytes / datawidth)
-    val cSlice = Mux(channelsPerSlice === 0.U, 0.U, logicalCoord(0) / channelsPerSlice)
-    val cInSlice = Mux(channelsPerSlice === 0.U, 0.U, logicalCoord(0) % channelsPerSlice)
+    // Tensor S2G v0 only accepts 4-byte elements, checked in s_setup.
+    val cSlice = Mux(interleaveMode === 1.U, logicalCoord(0) >> 2, logicalCoord(0) >> 3)
+    val cInSlice = Mux(
+      interleaveMode === 1.U,
+      logicalCoord(0)(1, 0).pad(xLen),
+      logicalCoord(0)(2, 0).pad(xLen)
+    )
     val cSliceStride = Wire(UInt(xLen.W))
     cSliceStride := sliceBytes
     when(rank === 3.U) { cSliceStride := byteStride(1) * globalDim(1) }
@@ -129,7 +132,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
       .elsewhen(rank === 5.U) { cSliceStride := byteStride(3) * globalDim(3) }
 
     val interleaved = base +
-      cInSlice * datawidth +
+      cInSlice * dma_aligned_bulk.U(xLen.W) +
       cSlice * cSliceStride +
       logicalCoord(1) * byteStride(1) +
       logicalCoord(2) * byteStride(2) +
@@ -186,11 +189,25 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   outRowStride(1) := 1.U
   (2 until 5).foreach { i => outRowStride(i) := outRowStride(i - 1) * outDim(i - 1) }
 
-  idxRem(0) := linReg
+  (0 until 5).foreach { i => currentIdx(i) := currentIdxReg(i) }
+
+  val currentLastDim = Wire(Vec(5, Bool()))
   (0 until 5).foreach { i =>
-    currentIdx(i) := Mux(outDim(i) === 0.U, 0.U, idxRem(i) % outDim(i))
-    idxRem(i + 1) := Mux(outDim(i) === 0.U, 0.U, idxRem(i) / outDim(i))
+    currentLastDim(i) := (tvars.tensorRank <= i.U) || ((currentIdxReg(i) + 1.U) >= outDim(i))
   }
+  val currentIdxNext = Wire(Vec(5, UInt(xLen.W)))
+  val currentIdxCarry = Wire(Vec(6, Bool()))
+  currentIdxCarry(0) := true.B
+  (0 until 5).foreach { i =>
+    val activeDim = tvars.tensorRank > i.U
+    currentIdxNext(i) := currentIdxReg(i)
+    when(currentIdxCarry(i) && activeDim) {
+      currentIdxNext(i) := Mux(currentLastDim(i), 0.U, currentIdxReg(i) + 1.U)
+    }
+    currentIdxCarry(i + 1) := currentIdxCarry(i) && currentLastDim(i)
+  }
+  val currentLast = currentIdxCarry(5)
+  val outDimZero = (0 until 5).map(i => outDim(i) === 0.U).reduce(_ || _)
 
   currentCoord(0) := coords(0) + currentIdx(0) * tvars.elementStrides(0)
   currentCoord(1) := coords(1) + currentIdx(1) * tvars.elementStrides(1)
@@ -205,13 +222,6 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   }
   val currentValid = Wire(Bool())
   currentValid := currentValidExpr
-
-  var currentLastExpr = true.B
-  (0 until 5).foreach { i =>
-    currentLastExpr = currentLastExpr && ((tvars.tensorRank <= i.U) || ((currentIdx(i) + 1.U) >= outDim(i)))
-  }
-  val currentLast = Wire(Bool())
-  currentLast := currentLastExpr
 
   val sharedLogicalOffset = Wire(UInt(xLen.W))
   val sharedRow = Wire(UInt(xLen.W))
@@ -318,7 +328,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     for (i <- 0 until 5) {
       coordsReg(i) := io.from_fifo.bits.in2(i)
     }
-    linReg := 0.U
+    (0 until 5).foreach { i => currentIdxReg(i) := 0.U }
     for (i <- 0 until 32) {
       descWordsReg(i) := 0.U
     }
@@ -356,15 +366,15 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
         assert(tvars.datawidth === dma_aligned_bulk.U,
           "DMA tensor S2G v0 supports only 4-byte elements")
       }
-      state := Mux(outDim(0) === 0.U, s_complete, s_check)
+      state := Mux(outDimZero, s_complete, s_check)
     }
     is(s_check) {
-      when(linReg >= (outDim(0) * outDim(1) * outDim(2) * outDim(3) * outDim(4))) {
-        state := s_complete
-      }.elsewhen(currentValid) {
+      when(currentValid) {
         state := s_shared_req
+      }.elsewhen(currentLast) {
+        state := s_complete
       }.otherwise {
-        linReg := linReg + 1.U
+        (0 until 5).foreach { i => currentIdxReg(i) := currentIdxNext(i) }
       }
     }
     is(s_shared_req) {
@@ -401,7 +411,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
         when(currentLast) {
           state := s_complete
         }.otherwise {
-          linReg := linReg + 1.U
+          (0 until 5).foreach { i => currentIdxReg(i) := currentIdxNext(i) }
           state := s_check
         }
       }
