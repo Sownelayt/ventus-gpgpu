@@ -68,9 +68,38 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     )
   )
 
-  val (s_idle :: s_desc_tlb_req :: s_desc_tlb_rsp :: s_desc_l2_req :: s_desc_l2_rsp ::
-    s_setup :: s_check :: s_shared_req :: s_shared_rsp :: s_tlb_req :: s_tlb_rsp ::
-    s_l2_req :: s_l2_rsp :: s_complete :: Nil) = Enum(14)
+  val tensorS2GStates = Enum(31)
+  val s_idle = tensorS2GStates(0)
+  val s_desc_tlb_req = tensorS2GStates(1)
+  val s_desc_tlb_rsp = tensorS2GStates(2)
+  val s_desc_l2_req = tensorS2GStates(3)
+  val s_desc_l2_rsp = tensorS2GStates(4)
+  val s_addr_init = tensorS2GStates(5)
+  val s_addr_pitch = tensorS2GStates(6)
+  val s_addr_slice = tensorS2GStates(7)
+  val s_addr_dim1 = tensorS2GStates(8)
+  val s_addr_dim2 = tensorS2GStates(9)
+  val s_addr_dim3 = tensorS2GStates(10)
+  val s_addr_dim4 = tensorS2GStates(11)
+  val s_setup = tensorS2GStates(12)
+  val s_setup_stride_1 = tensorS2GStates(13)
+  val s_setup_stride_2 = tensorS2GStates(14)
+  val s_setup_stride_3 = tensorS2GStates(15)
+  val s_setup_stride_4 = tensorS2GStates(16)
+  val s_prepare = tensorS2GStates(17)
+  val s_prepare_addr = tensorS2GStates(18)
+  val s_check = tensorS2GStates(19)
+  val s_shared_req = tensorS2GStates(20)
+  val s_shared_rsp = tensorS2GStates(21)
+  val s_tlb_req = tensorS2GStates(22)
+  val s_tlb_rsp = tensorS2GStates(23)
+  val s_l2_req = tensorS2GStates(24)
+  val s_l2_rsp = tensorS2GStates(25)
+  val s_complete = tensorS2GStates(26)
+  val s_addr_mul_start = tensorS2GStates(27)
+  val s_addr_mul_wait = tensorS2GStates(28)
+  val s_setup_mul_start = tensorS2GStates(29)
+  val s_setup_mul_wait = tensorS2GStates(30)
   val state = RegInit(s_idle)
 
   val sharedSrcReg = RegInit(0.U(xLen.W))
@@ -79,8 +108,38 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val asidReg = RegInit(0.U(SV32.asidLen.W))
   val pAddrReg = RegInit(0.U(SV32.paLen.W))
   val currentIdxReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val currentCoordReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val outDimReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val outStrideBytesReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val sharedRowStrideReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val globalStrideBytesReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val globalOffsetPartReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val globalLogicalOffsetReg = RegInit(0.U(xLen.W))
+  val linearGlobalBaseReg = RegInit(0.U(xLen.W))
+  val sharedOffsetPartReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val sharedRowPartReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val sharedLogicalOffsetReg = RegInit(0.U(xLen.W))
+  val sharedRowReg = RegInit(0.U(xLen.W))
+  val currentValidReg = RegInit(false.B)
+  val currentLastReg = RegInit(false.B)
+  val currentIdxNextReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val currentAdvanceDimOHReg = RegInit(VecInit(Seq.fill(5)(false.B)))
+  val globalDim0OffsetStepReg = RegInit(0.U(xLen.W))
+  val globalOffsetPartNextReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val sharedOffsetPartNextReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val sharedRowPartNextReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
+  val globalReqLineBaseReg = RegInit(0.U(xLen.W))
+  val globalReqWordReg = RegInit(0.U((lineOffsetBits - wordOffsetBits).W))
+  val sharedSetReg = RegInit(0.U((sharedSetIdxHi - sharedSetIdxLo + 1).W))
+  val sharedBlockReg = RegInit(0.U(dcache_BlockOffsetBits.W))
   val sharedDataReg = Reg(UInt(xLen.W))
   val descWordsReg = RegInit(VecInit(Seq.fill(32)(0.U(xLen.W))))
+  val descBoxAddressReg = RegInit(0.U(xLen.W))
+  val descAddrAccumReg = RegInit(0.U(xLen.W))
+  val descAddrSliceStrideReg = RegInit(0.U(xLen.W))
+  val descAddrOpReg = RegInit(0.U(3.W))
+  val setupMulOpReg = RegInit(0.U(3.W))
+  val tmaSetupMul = Module(new TmaMul32Unit)
 
   val coordsReg = Reg(Vec(5, UInt(xLen.W)))
   val coords = Wire(Vec(5, UInt(xLen.W)))
@@ -89,10 +148,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val tvars = Wire(new TensorVars)
   val descControl = descWordsReg(1)
   val descByteStride = Wire(Vec(5, UInt(xLen.W)))
-  val descBoxAddress = Wire(UInt(xLen.W))
   val outDim = Wire(Vec(5, UInt(xLen.W)))
-  val outStrideBytes = Wire(Vec(5, UInt(xLen.W)))
-  val outRowStride = Wire(Vec(5, UInt(xLen.W)))
   val currentIdx = Wire(Vec(5, UInt(xLen.W)))
   val currentCoord = Wire(Vec(5, UInt(xLen.W)))
 
@@ -101,22 +157,28 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val descGlobalDim = Wire(Vec(5, UInt(xLen.W)))
   (0 until 5).foreach { i => descGlobalDim(i) := descWordsReg(4 + i) }
 
-  def tensorGlobalAddress(
+  def tensorLinearAddress(
+      base: UInt,
+      logicalCoord: Vec[UInt],
+      byteStride: Vec[UInt],
+      datawidth: UInt
+  ): UInt = {
+    base +
+      TmaPow2Math.scaleByDataWidth(logicalCoord(0), datawidth) +
+      logicalCoord(1) * byteStride(1) +
+      logicalCoord(2) * byteStride(2) +
+      logicalCoord(3) * byteStride(3) +
+      logicalCoord(4) * byteStride(4)
+  }
+
+  def tensorInterleaveAddress(
       base: UInt,
       logicalCoord: Vec[UInt],
       rank: UInt,
       globalDim: Vec[UInt],
       byteStride: Vec[UInt],
-      datawidth: UInt,
       interleaveMode: UInt
   ): UInt = {
-    val linear = base +
-      logicalCoord(0) * byteStride(0) +
-      logicalCoord(1) * byteStride(1) +
-      logicalCoord(2) * byteStride(2) +
-      logicalCoord(3) * byteStride(3) +
-      logicalCoord(4) * byteStride(4)
-
     val sliceBytes = Mux(interleaveMode === 1.U, 16.U(xLen.W), 32.U(xLen.W))
     // Tensor S2G v0 only accepts 4-byte elements, checked in s_setup.
     val cSlice = Mux(interleaveMode === 1.U, logicalCoord(0) >> 2, logicalCoord(0) >> 3)
@@ -131,28 +193,16 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
       .elsewhen(rank === 4.U) { cSliceStride := byteStride(2) * globalDim(2) }
       .elsewhen(rank === 5.U) { cSliceStride := byteStride(3) * globalDim(3) }
 
-    val interleaved = base +
-      cInSlice * dma_aligned_bulk.U(xLen.W) +
+    base +
+      ((cInSlice << log2Ceil(dma_aligned_bulk))(xLen - 1, 0)) +
       cSlice * cSliceStride +
       logicalCoord(1) * byteStride(1) +
       logicalCoord(2) * byteStride(2) +
       logicalCoord(3) * byteStride(3) +
       logicalCoord(4) * byteStride(4)
-
-    Mux(interleaveMode === 0.U, linear, interleaved)
   }
 
-  descBoxAddress := tensorGlobalAddress(
-    descWordsReg(2),
-    coords,
-    descControl(6, 4),
-    descGlobalDim,
-    descByteStride,
-    tensorDataWidth(descControl(3, 0)),
-    descControl(9, 8)
-  )
-
-  tvars.BoxAddress := descBoxAddress
+  tvars.BoxAddress := descBoxAddressReg
   (0 until 5).foreach { i =>
     tvars.boxDim(i) := descWordsReg(14 + i)
     tvars.elementStrides(i) := Mux(descWordsReg(19 + i) === 0.U, 1.U, descWordsReg(19 + i))
@@ -170,7 +220,57 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   tvars.globalStrides(2) := descByteStride(3)
   tvars.globalStrides(3) := descByteStride(4)
   tvars.globalStrides(4) := 0.U
-  tvars.datawidth := tensorDataWidth(tvars.dataType)
+  tvars.datawidth := dma_aligned_bulk.U
+
+  val descAddrOpPitch = 0.U(3.W)
+  val descAddrOpSlice = 1.U(3.W)
+  val descAddrOpDim1 = 2.U(3.W)
+  val descAddrOpDim2 = 3.U(3.W)
+  val descAddrOpDim3 = 4.U(3.W)
+  val descAddrOpDim4 = 5.U(3.W)
+
+  val setupMulOpByte2 = 0.U(3.W)
+  val setupMulOpByte3 = 1.U(3.W)
+  val setupMulOpRow3 = 2.U(3.W)
+  val setupMulOpByte4 = 3.U(3.W)
+  val setupMulOpRow4 = 4.U(3.W)
+
+  val descAddrMulA = WireDefault(0.U(xLen.W))
+  val descAddrMulB = WireDefault(0.U(xLen.W))
+  switch(descAddrOpReg) {
+    is(descAddrOpPitch) {
+      descAddrMulA := MuxLookup(tvars.tensorRank, 0.U(xLen.W))(Seq(
+        3.U -> descByteStride(1),
+        4.U -> descByteStride(2),
+        5.U -> descByteStride(3)
+      ))
+      descAddrMulB := MuxLookup(tvars.tensorRank, 0.U(xLen.W))(Seq(
+        3.U -> tvars.globalDim(1),
+        4.U -> tvars.globalDim(2),
+        5.U -> tvars.globalDim(3)
+      ))
+    }
+    is(descAddrOpSlice) {
+      descAddrMulA := Mux(tvars.interleaveMode === 1.U, coords(0) >> 2, coords(0) >> 3)
+      descAddrMulB := descAddrSliceStrideReg
+    }
+    is(descAddrOpDim1) {
+      descAddrMulA := coords(1)
+      descAddrMulB := descByteStride(1)
+    }
+    is(descAddrOpDim2) {
+      descAddrMulA := coords(2)
+      descAddrMulB := descByteStride(2)
+    }
+    is(descAddrOpDim3) {
+      descAddrMulA := coords(3)
+      descAddrMulB := descByteStride(3)
+    }
+    is(descAddrOpDim4) {
+      descAddrMulA := coords(4)
+      descAddrMulB := descByteStride(4)
+    }
+  }
 
   outDim(0) := tvars.boxDim(0)
   (1 until 5).foreach { i =>
@@ -178,22 +278,15 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
       tvars.tensorRank > i.U,
       Mux(tvars.elementStrides(i) <= 1.U,
         tvars.boxDim(i),
-        (tvars.boxDim(i) + tvars.elementStrides(i) - 1.U) / tvars.elementStrides(i)),
+        TmaPow2Math.ceilDivPow2(tvars.boxDim(i), tvars.elementStrides(i))),
       1.U)
   }
-
-  outStrideBytes(0) := tvars.datawidth
-  (1 until 5).foreach { i => outStrideBytes(i) := outStrideBytes(i - 1) * outDim(i - 1) }
-
-  outRowStride(0) := 0.U
-  outRowStride(1) := 1.U
-  (2 until 5).foreach { i => outRowStride(i) := outRowStride(i - 1) * outDim(i - 1) }
 
   (0 until 5).foreach { i => currentIdx(i) := currentIdxReg(i) }
 
   val currentLastDim = Wire(Vec(5, Bool()))
   (0 until 5).foreach { i =>
-    currentLastDim(i) := (tvars.tensorRank <= i.U) || ((currentIdxReg(i) + 1.U) >= outDim(i))
+    currentLastDim(i) := (tvars.tensorRank <= i.U) || ((currentIdxReg(i) + 1.U) >= outDimReg(i))
   }
   val currentIdxNext = Wire(Vec(5, UInt(xLen.W)))
   val currentIdxCarry = Wire(Vec(6, Bool()))
@@ -207,13 +300,49 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     currentIdxCarry(i + 1) := currentIdxCarry(i) && currentLastDim(i)
   }
   val currentLast = currentIdxCarry(5)
-  val outDimZero = (0 until 5).map(i => outDim(i) === 0.U).reduce(_ || _)
+  val currentAdvanceDimOH = Wire(Vec(5, Bool()))
+  (0 until 5).foreach { i =>
+    currentAdvanceDimOH(i) := currentIdxCarry(i) && (tvars.tensorRank > i.U) && !currentLastDim(i)
+  }
+  val outDimZeroSetup = (0 until 5).map(i => outDim(i) === 0.U).reduce(_ || _)
 
-  currentCoord(0) := coords(0) + currentIdx(0) * tvars.elementStrides(0)
-  currentCoord(1) := coords(1) + currentIdx(1) * tvars.elementStrides(1)
-  currentCoord(2) := coords(2) + currentIdx(2) * tvars.elementStrides(2)
-  currentCoord(3) := coords(3) + currentIdx(3) * tvars.elementStrides(3)
-  currentCoord(4) := coords(4) + currentIdx(4) * tvars.elementStrides(4)
+  val setupMulA = WireDefault(0.U(xLen.W))
+  val setupMulB = WireDefault(0.U(xLen.W))
+  switch(setupMulOpReg) {
+    is(setupMulOpByte2) {
+      setupMulA := outStrideBytesReg(1)
+      setupMulB := outDimReg(1)
+    }
+    is(setupMulOpByte3) {
+      setupMulA := outStrideBytesReg(2)
+      setupMulB := outDimReg(2)
+    }
+    is(setupMulOpRow3) {
+      setupMulA := sharedRowStrideReg(2)
+      setupMulB := outDimReg(2)
+    }
+    is(setupMulOpByte4) {
+      setupMulA := outStrideBytesReg(3)
+      setupMulB := outDimReg(3)
+    }
+    is(setupMulOpRow4) {
+      setupMulA := sharedRowStrideReg(3)
+      setupMulB := outDimReg(3)
+    }
+  }
+
+  val tmaSetupMulA = Mux(state === s_addr_mul_start, descAddrMulA, setupMulA)
+  val tmaSetupMulB = Mux(state === s_addr_mul_start, descAddrMulB, setupMulB)
+  tmaSetupMul.io.in.valid := state === s_addr_mul_start || state === s_setup_mul_start
+  tmaSetupMul.io.in.bits.a := tmaSetupMulA
+  tmaSetupMul.io.in.bits.b := tmaSetupMulB
+  tmaSetupMul.io.out.ready := state === s_addr_mul_wait || state === s_setup_mul_wait
+
+  currentCoord(0) := coords(0) + TmaPow2Math.scaleByPow2(currentIdx(0), tvars.elementStrides(0))
+  currentCoord(1) := coords(1) + TmaPow2Math.scaleByPow2(currentIdx(1), tvars.elementStrides(1))
+  currentCoord(2) := coords(2) + TmaPow2Math.scaleByPow2(currentIdx(2), tvars.elementStrides(2))
+  currentCoord(3) := coords(3) + TmaPow2Math.scaleByPow2(currentIdx(3), tvars.elementStrides(3))
+  currentCoord(4) := coords(4) + TmaPow2Math.scaleByPow2(currentIdx(4), tvars.elementStrides(4))
 
   val currentValidExpr0 = currentCoord(0) < tvars.globalDim(0)
   var currentValidExpr = currentValidExpr0
@@ -223,34 +352,71 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val currentValid = Wire(Bool())
   currentValid := currentValidExpr
 
-  val sharedLogicalOffset = Wire(UInt(xLen.W))
-  val sharedRow = Wire(UInt(xLen.W))
-  val sharedRowStride = Wire(Vec(5, UInt(xLen.W)))
-  sharedRowStride(0) := 0.U
-  sharedRowStride(1) := 1.U
-  (2 until 5).foreach { i => sharedRowStride(i) := sharedRowStride(i - 1) * outDim(i - 1) }
-  sharedLogicalOffset :=
-    currentIdx(0) * outStrideBytes(0) +
-      currentIdx(1) * outStrideBytes(1) +
-      currentIdx(2) * outStrideBytes(2) +
-      currentIdx(3) * outStrideBytes(3) +
-      currentIdx(4) * outStrideBytes(4)
-  sharedRow :=
-    currentIdx(1) * sharedRowStride(1) +
-      currentIdx(2) * sharedRowStride(2) +
-      currentIdx(3) * sharedRowStride(3) +
-      currentIdx(4) * sharedRowStride(4)
-
-  val sharedCurrentAddr = swizzleSharedAddr(sharedSrcReg + sharedLogicalOffset, sharedSrcReg, tvars.swizzleMode, sharedRow)
-  val globalCurrentAddr = tensorGlobalAddress(
-    tvars.globalAddress,
-    currentCoord,
-    tvars.tensorRank,
-    tvars.globalDim,
-    descByteStride,
-    tvars.datawidth,
+  val nextCoord0ForOffset = coords(0) + TmaPow2Math.scaleByPow2(currentIdxNext(0), tvars.elementStrides(0))
+  val globalInterleaveDim0DeltaBytes = TmaPow2Math.interleaveDim0DeltaBytes(
+    currentCoord(0),
+    nextCoord0ForOffset,
+    descAddrSliceStrideReg,
     tvars.interleaveMode
   )
+  val globalDim0OffsetStep = Mux(
+    tvars.interleaveMode === 0.U,
+    globalStrideBytesReg(0),
+    globalInterleaveDim0DeltaBytes
+  )
+
+  val globalOffsetPartPrepared = Wire(Vec(5, UInt(xLen.W)))
+  val sharedOffsetPartPrepared = Wire(Vec(5, UInt(xLen.W)))
+  val sharedRowPartPrepared = Wire(Vec(5, UInt(xLen.W)))
+  (0 until 5).foreach { i =>
+    globalOffsetPartPrepared(i) := globalOffsetPartReg(i)
+    sharedOffsetPartPrepared(i) := sharedOffsetPartReg(i)
+    sharedRowPartPrepared(i) := sharedRowPartReg(i)
+  }
+  when(currentAdvanceDimOHReg(0)) {
+    globalOffsetPartPrepared(0) := globalOffsetPartReg(0) + globalDim0OffsetStepReg
+    sharedOffsetPartPrepared(0) := sharedOffsetPartReg(0) + outStrideBytesReg(0)
+  }.elsewhen(currentAdvanceDimOHReg(1)) {
+    globalOffsetPartPrepared(0) := 0.U
+    globalOffsetPartPrepared(1) := globalOffsetPartReg(1) + globalStrideBytesReg(1)
+    sharedOffsetPartPrepared(0) := 0.U
+    sharedOffsetPartPrepared(1) := sharedOffsetPartReg(1) + outStrideBytesReg(1)
+    sharedRowPartPrepared(1) := sharedRowPartReg(1) + sharedRowStrideReg(1)
+  }.elsewhen(currentAdvanceDimOHReg(2)) {
+    (0 until 2).foreach { i =>
+      globalOffsetPartPrepared(i) := 0.U
+      sharedOffsetPartPrepared(i) := 0.U
+      sharedRowPartPrepared(i) := 0.U
+    }
+    globalOffsetPartPrepared(2) := globalOffsetPartReg(2) + globalStrideBytesReg(2)
+    sharedOffsetPartPrepared(2) := sharedOffsetPartReg(2) + outStrideBytesReg(2)
+    sharedRowPartPrepared(2) := sharedRowPartReg(2) + sharedRowStrideReg(2)
+  }.elsewhen(currentAdvanceDimOHReg(3)) {
+    (0 until 3).foreach { i =>
+      globalOffsetPartPrepared(i) := 0.U
+      sharedOffsetPartPrepared(i) := 0.U
+      sharedRowPartPrepared(i) := 0.U
+    }
+    globalOffsetPartPrepared(3) := globalOffsetPartReg(3) + globalStrideBytesReg(3)
+    sharedOffsetPartPrepared(3) := sharedOffsetPartReg(3) + outStrideBytesReg(3)
+    sharedRowPartPrepared(3) := sharedRowPartReg(3) + sharedRowStrideReg(3)
+  }.elsewhen(currentAdvanceDimOHReg(4)) {
+    (0 until 4).foreach { i =>
+      globalOffsetPartPrepared(i) := 0.U
+      sharedOffsetPartPrepared(i) := 0.U
+      sharedRowPartPrepared(i) := 0.U
+    }
+    globalOffsetPartPrepared(4) := globalOffsetPartReg(4) + globalStrideBytesReg(4)
+    sharedOffsetPartPrepared(4) := sharedOffsetPartReg(4) + outStrideBytesReg(4)
+    sharedRowPartPrepared(4) := sharedRowPartReg(4) + sharedRowStrideReg(4)
+  }
+
+  val globalLogicalOffset = globalOffsetPartReg.reduce(_ + _)
+  val sharedLogicalOffset = sharedOffsetPartReg.reduce(_ + _)
+  val sharedRow = sharedRowPartReg.reduce(_ + _)
+
+  val sharedCurrentAddr = swizzleSharedAddr(sharedSrcReg + sharedLogicalOffsetReg, sharedSrcReg, tvars.swizzleMode, sharedRowReg)
+  val globalCurrentAddr = linearGlobalBaseReg + globalLogicalOffsetReg
 
   val globalReqLineBase = alignToL2Line(globalCurrentAddr)
   val globalReqWord = globalCurrentAddr(lineOffsetBits - 1, wordOffsetBits)
@@ -268,10 +434,10 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   io.shared_req.valid := state === s_shared_req
   io.shared_req.bits.instrId := 1.U
   io.shared_req.bits.isWrite := false.B
-  io.shared_req.bits.setIdx := sharedSet
+  io.shared_req.bits.setIdx := sharedSetReg
   (0 until numgroupshared).foreach { lane =>
     io.shared_req.bits.perLaneAddr(lane).activeMask := (if (lane == 0) true.B else false.B)
-    io.shared_req.bits.perLaneAddr(lane).blockOffset := sharedBlock
+    io.shared_req.bits.perLaneAddr(lane).blockOffset := sharedBlockReg
     io.shared_req.bits.perLaneAddr(lane).wordOffset1H := (if (lane == 0) Fill(BytesOfWord, 1.U) else 0.U)
     io.shared_req.bits.data(lane) := 0.U
   }
@@ -281,7 +447,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   io.to_l2TLB.valid := state === s_tlb_req || state === s_desc_tlb_req
   io.to_l2TLB.bits.vaddr := Mux(state === s_desc_tlb_req || state === s_desc_tlb_rsp || state === s_desc_l2_req || state === s_desc_l2_rsp,
     alignToL2Line(descPtrReg),
-    globalReqLineBase)
+    globalReqLineBaseReg)
   io.to_l2TLB.bits.asid := asidReg
   io.from_l2TLB.ready := state === s_tlb_rsp || state === s_desc_tlb_rsp
 
@@ -292,8 +458,8 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     l2Data(i) := 0.U
   }
   when(state === s_l2_req) {
-    l2Mask(globalReqWord) := Fill(BytesOfWord, 1.U)
-    l2Data(globalReqWord) := sharedDataReg
+    l2Mask(globalReqWordReg) := Fill(BytesOfWord, 1.U)
+    l2Data(globalReqWordReg) := sharedDataReg
   }.otherwise {
     (0 until dcache_BlockWords).foreach { i =>
       l2Mask(i) := Fill(BytesOfWord, 1.U)
@@ -328,7 +494,24 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     for (i <- 0 until 5) {
       coordsReg(i) := io.from_fifo.bits.in2(i)
     }
-    (0 until 5).foreach { i => currentIdxReg(i) := 0.U }
+    (0 until 5).foreach { i =>
+      currentIdxReg(i) := 0.U
+      currentIdxNextReg(i) := 0.U
+      currentAdvanceDimOHReg(i) := false.B
+      globalOffsetPartReg(i) := 0.U
+      globalOffsetPartNextReg(i) := 0.U
+      sharedOffsetPartReg(i) := 0.U
+      sharedOffsetPartNextReg(i) := 0.U
+      sharedRowPartReg(i) := 0.U
+      sharedRowPartNextReg(i) := 0.U
+    }
+    globalDim0OffsetStepReg := 0.U
+    globalLogicalOffsetReg := 0.U
+    descBoxAddressReg := 0.U
+    descAddrAccumReg := 0.U
+    descAddrSliceStrideReg := 0.U
+    descAddrOpReg := descAddrOpPitch
+    setupMulOpReg := setupMulOpByte2
     for (i <- 0 until 32) {
       descWordsReg(i) := 0.U
     }
@@ -353,7 +536,65 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
       when(io.to_l2cache.fire) { state := s_desc_l2_rsp }
     }
     is(s_desc_l2_rsp) {
-      when(io.from_l2cache.fire) { state := s_setup }
+      when(io.from_l2cache.fire) { state := s_addr_init }
+    }
+    is(s_addr_init) {
+      val cInSlice = Mux(
+        tvars.interleaveMode === 1.U,
+        coords(0)(1, 0).pad(xLen),
+        coords(0)(2, 0).pad(xLen)
+      )
+      val linearStart =
+        descWordsReg(2) + ((coords(0) << log2Ceil(dma_aligned_bulk))(xLen - 1, 0))
+      val interleaveStart =
+        descWordsReg(2) + ((cInSlice << log2Ceil(dma_aligned_bulk))(xLen - 1, 0))
+      descAddrAccumReg := Mux(tvars.interleaveMode === 0.U, linearStart, interleaveStart)
+      descAddrSliceStrideReg := Mux(tvars.interleaveMode === 1.U, 16.U(xLen.W), 32.U(xLen.W))
+      descAddrOpReg := descAddrOpPitch
+      state := s_addr_mul_start
+    }
+    is(s_addr_mul_start) {
+      when(tmaSetupMul.io.in.fire) { state := s_addr_mul_wait }
+    }
+    is(s_addr_mul_wait) {
+      when(tmaSetupMul.io.out.fire) {
+        val product = tmaSetupMul.io.out.bits
+        switch(descAddrOpReg) {
+          is(descAddrOpPitch) {
+            when(tvars.interleaveMode =/= 0.U && tvars.tensorRank >= 3.U) {
+              descAddrSliceStrideReg := product
+            }
+            descAddrOpReg := descAddrOpSlice
+            state := s_addr_mul_start
+          }
+          is(descAddrOpSlice) {
+            when(tvars.interleaveMode =/= 0.U) {
+              descAddrAccumReg := descAddrAccumReg + product
+            }
+            descAddrOpReg := descAddrOpDim1
+            state := s_addr_mul_start
+          }
+          is(descAddrOpDim1) {
+            descAddrAccumReg := descAddrAccumReg + product
+            descAddrOpReg := descAddrOpDim2
+            state := s_addr_mul_start
+          }
+          is(descAddrOpDim2) {
+            descAddrAccumReg := descAddrAccumReg + product
+            descAddrOpReg := descAddrOpDim3
+            state := s_addr_mul_start
+          }
+          is(descAddrOpDim3) {
+            descAddrAccumReg := descAddrAccumReg + product
+            descAddrOpReg := descAddrOpDim4
+            state := s_addr_mul_start
+          }
+          is(descAddrOpDim4) {
+            descBoxAddressReg := descAddrAccumReg + product
+            state := s_setup
+          }
+        }
+      }
     }
     is(s_setup) {
       when(!reset.asBool) {
@@ -363,18 +604,116 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
           assert(tvars.tensorRank >= 3.U,
             "DMA tensor S2G interleave requires rank >= 3")
         }
-        assert(tvars.datawidth === dma_aligned_bulk.U,
+        assert(tensorDataWidth(tvars.dataType) === dma_aligned_bulk.U,
           "DMA tensor S2G v0 supports only 4-byte elements")
+        (0 until 5).foreach { d =>
+          assert(TmaPow2Math.isSupportedStride(tvars.elementStrides(d)),
+            "DMA tensor S2G v0 supports only power-of-two element strides up to 32")
+        }
       }
-      state := Mux(outDimZero, s_complete, s_check)
+      (0 until 5).foreach { i =>
+        outDimReg(i) := outDim(i)
+        outStrideBytesReg(i) := 0.U
+        sharedRowStrideReg(i) := 0.U
+        globalStrideBytesReg(i) := 0.U
+        currentIdxNextReg(i) := 0.U
+        currentAdvanceDimOHReg(i) := false.B
+        globalOffsetPartReg(i) := 0.U
+        globalOffsetPartNextReg(i) := 0.U
+        sharedOffsetPartReg(i) := 0.U
+        sharedOffsetPartNextReg(i) := 0.U
+        sharedRowPartReg(i) := 0.U
+        sharedRowPartNextReg(i) := 0.U
+      }
+      globalLogicalOffsetReg := 0.U
+      linearGlobalBaseReg := descBoxAddressReg
+      outStrideBytesReg(0) := dma_aligned_bulk.U
+      sharedRowStrideReg(1) := 1.U
+      globalStrideBytesReg(0) := TmaPow2Math.scaleByDataWidth(tvars.elementStrides(0), tvars.datawidth)
+      (1 until 5).foreach { i =>
+        globalStrideBytesReg(i) := TmaPow2Math.scaleByPow2(descByteStride(i), tvars.elementStrides(i))
+      }
+      state := Mux(outDimZeroSetup, s_complete, s_setup_stride_1)
+    }
+    is(s_setup_stride_1) {
+      outStrideBytesReg(1) := (outDimReg(0) << log2Ceil(dma_aligned_bulk))(xLen - 1, 0)
+      sharedRowStrideReg(2) := outDimReg(1)
+      setupMulOpReg := setupMulOpByte2
+      state := s_setup_mul_start
+    }
+    is(s_setup_mul_start) {
+      when(tmaSetupMul.io.in.fire) { state := s_setup_mul_wait }
+    }
+    is(s_setup_mul_wait) {
+      when(tmaSetupMul.io.out.fire) {
+        val product = tmaSetupMul.io.out.bits
+        switch(setupMulOpReg) {
+          is(setupMulOpByte2) {
+            outStrideBytesReg(2) := product
+            setupMulOpReg := setupMulOpByte3
+            state := s_setup_mul_start
+          }
+          is(setupMulOpByte3) {
+            outStrideBytesReg(3) := product
+            setupMulOpReg := setupMulOpRow3
+            state := s_setup_mul_start
+          }
+          is(setupMulOpRow3) {
+            sharedRowStrideReg(3) := product
+            setupMulOpReg := setupMulOpByte4
+            state := s_setup_mul_start
+          }
+          is(setupMulOpByte4) {
+            outStrideBytesReg(4) := product
+            setupMulOpReg := setupMulOpRow4
+            state := s_setup_mul_start
+          }
+          is(setupMulOpRow4) {
+            sharedRowStrideReg(4) := product
+            state := s_prepare
+          }
+        }
+      }
+    }
+    is(s_prepare) {
+      (0 until 5).foreach { i =>
+        currentCoordReg(i) := currentCoord(i)
+        currentIdxNextReg(i) := currentIdxNext(i)
+        currentAdvanceDimOHReg(i) := currentAdvanceDimOH(i)
+      }
+      globalDim0OffsetStepReg := globalDim0OffsetStep
+      globalLogicalOffsetReg := globalLogicalOffset
+      sharedLogicalOffsetReg := sharedLogicalOffset
+      sharedRowReg := sharedRow
+      currentValidReg := currentValid
+      currentLastReg := currentLast
+      state := s_prepare_addr
+    }
+    is(s_prepare_addr) {
+      globalReqLineBaseReg := globalReqLineBase
+      globalReqWordReg := globalReqWord
+      sharedSetReg := sharedSet
+      sharedBlockReg := sharedBlock
+      (0 until 5).foreach { i =>
+        globalOffsetPartNextReg(i) := globalOffsetPartPrepared(i)
+        sharedOffsetPartNextReg(i) := sharedOffsetPartPrepared(i)
+        sharedRowPartNextReg(i) := sharedRowPartPrepared(i)
+      }
+      state := s_check
     }
     is(s_check) {
-      when(currentValid) {
+      when(currentValidReg) {
         state := s_shared_req
-      }.elsewhen(currentLast) {
+      }.elsewhen(currentLastReg) {
         state := s_complete
       }.otherwise {
-        (0 until 5).foreach { i => currentIdxReg(i) := currentIdxNext(i) }
+        (0 until 5).foreach { i =>
+          currentIdxReg(i) := currentIdxNextReg(i)
+          globalOffsetPartReg(i) := globalOffsetPartNextReg(i)
+          sharedOffsetPartReg(i) := sharedOffsetPartNextReg(i)
+          sharedRowPartReg(i) := sharedRowPartNextReg(i)
+        }
+        state := s_prepare
       }
     }
     is(s_shared_req) {
@@ -408,11 +747,16 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
           assert(io.from_l2cache.bits.d_opcode === 0.U,
             "DMA tensor S2G L2 response must be AccessAck")
         }
-        when(currentLast) {
+        when(currentLastReg) {
           state := s_complete
         }.otherwise {
-          (0 until 5).foreach { i => currentIdxReg(i) := currentIdxNext(i) }
-          state := s_check
+          (0 until 5).foreach { i =>
+            currentIdxReg(i) := currentIdxNextReg(i)
+            globalOffsetPartReg(i) := globalOffsetPartNextReg(i)
+            sharedOffsetPartReg(i) := sharedOffsetPartNextReg(i)
+            sharedRowPartReg(i) := sharedRowPartNextReg(i)
+          }
+          state := s_prepare
         }
       }
     }

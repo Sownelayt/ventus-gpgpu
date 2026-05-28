@@ -67,7 +67,8 @@ class DmaS2G(implicit p: Parameters) extends Module {
   val pendingReadMaskReg = RegInit(0.U(numgroupshared.W))
   val laneL2WordReg = Reg(Vec(numgroupshared, UInt(log2Ceil(dcache_BlockWords).W)))
   val laneByteMaskReg = Reg(Vec(numgroupshared, UInt(BytesOfWord.W)))
-  val readDataReg = Reg(Vec(numgroupshared, UInt(xLen.W)))
+  val l2MaskReg = Reg(Vec(dcache_BlockWords, UInt(BytesOfWord.W)))
+  val l2DataReg = Reg(Vec(dcache_BlockWords, UInt(xLen.W)))
 
   val curSrc = srcReg + offsetReg
   val curDst = dstReg + offsetReg
@@ -116,17 +117,8 @@ class DmaS2G(implicit p: Parameters) extends Module {
   io.to_l2TLB.bits.asid := asidReg
   io.from_l2TLB.ready := state === s_tlb_rsp
 
-  val l2Mask = Wire(Vec(dcache_BlockWords, UInt(BytesOfWord.W)))
-  val l2Data = Wire(Vec(dcache_BlockWords, UInt(xLen.W)))
-  for (word <- 0 until dcache_BlockWords) {
-    val hits = (0 until numgroupshared).map { lane =>
-      laneMaskReg(lane) && laneL2WordReg(lane) === word.U
-    }
-    l2Mask(word) := Mux1H(hits, (0 until numgroupshared).map(lane => laneByteMaskReg(lane)))
-    l2Data(word) := Mux1H(hits, (0 until numgroupshared).map(lane => readDataReg(lane)))
-  }
   val fullWordMask = Fill(BytesOfWord, 1.U)
-  val isFullLinePut = l2Mask.map(_ === fullWordMask).reduce(_ && _)
+  val isFullLinePut = l2MaskReg.map(_ === fullWordMask).reduce(_ && _)
   val s2gSource = Cat(
     0.U(log2Ceil(max_dma_tag).W),
     0.U(log2Ceil(max_dma_inst).W),
@@ -138,8 +130,8 @@ class DmaS2G(implicit p: Parameters) extends Module {
   io.to_l2cache.bits.a_param := 0.U
   io.to_l2cache.bits.a_source := s2gSource
   io.to_l2cache.bits.a_addr.foreach(_ := pAddrReg)
-  io.to_l2cache.bits.a_data := l2Data
-  io.to_l2cache.bits.a_mask := l2Mask
+  io.to_l2cache.bits.a_data := l2DataReg
+  io.to_l2cache.bits.a_mask := l2MaskReg
   io.to_l2cache.bits.spike_info.foreach(_ := io.to_l2cache.bits.defaultSpikeInfo)
 
   io.from_l2cache.ready := state === s_l2_rsp
@@ -169,6 +161,10 @@ class DmaS2G(implicit p: Parameters) extends Module {
     chunkBytesReg := chunkBytes
     laneMaskReg := laneMask
     pendingReadMaskReg := laneMask
+    for (word <- 0 until dcache_BlockWords) {
+      l2MaskReg(word) := 0.U
+      l2DataReg(word) := 0.U
+    }
     for (lane <- 0 until numgroupshared) {
       val l2Word = dstStartWord + lane.U
       laneL2WordReg(lane) := l2Word(log2Ceil(dcache_BlockWords) - 1, 0)
@@ -188,7 +184,8 @@ class DmaS2G(implicit p: Parameters) extends Module {
     }
     for (lane <- 0 until numgroupshared) {
       when(io.shared_rsp.bits.activeMask(lane)) {
-        readDataReg(lane) := io.shared_rsp.bits.data(lane)
+        l2DataReg(laneL2WordReg(lane)) := io.shared_rsp.bits.data(lane)
+        l2MaskReg(laneL2WordReg(lane)) := laneByteMaskReg(lane)
       }
     }
     pendingReadMaskReg := pendingNext
