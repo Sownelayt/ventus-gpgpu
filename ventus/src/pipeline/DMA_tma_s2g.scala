@@ -68,7 +68,7 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     )
   )
 
-  val tensorS2GStates = Enum(31)
+  val tensorS2GStates = Enum(28)
   val s_idle = tensorS2GStates(0)
   val s_desc_tlb_req = tensorS2GStates(1)
   val s_desc_tlb_rsp = tensorS2GStates(2)
@@ -83,23 +83,20 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val s_addr_dim4 = tensorS2GStates(11)
   val s_setup = tensorS2GStates(12)
   val s_setup_stride_1 = tensorS2GStates(13)
-  val s_setup_stride_2 = tensorS2GStates(14)
-  val s_setup_stride_3 = tensorS2GStates(15)
-  val s_setup_stride_4 = tensorS2GStates(16)
-  val s_prepare = tensorS2GStates(17)
-  val s_prepare_addr = tensorS2GStates(18)
-  val s_check = tensorS2GStates(19)
-  val s_shared_req = tensorS2GStates(20)
-  val s_shared_rsp = tensorS2GStates(21)
-  val s_tlb_req = tensorS2GStates(22)
-  val s_tlb_rsp = tensorS2GStates(23)
-  val s_l2_req = tensorS2GStates(24)
-  val s_l2_rsp = tensorS2GStates(25)
-  val s_complete = tensorS2GStates(26)
-  val s_addr_mul_start = tensorS2GStates(27)
-  val s_addr_mul_wait = tensorS2GStates(28)
-  val s_setup_mul_start = tensorS2GStates(29)
-  val s_setup_mul_wait = tensorS2GStates(30)
+  val s_prepare = tensorS2GStates(14)
+  val s_prepare_addr = tensorS2GStates(15)
+  val s_check = tensorS2GStates(16)
+  val s_shared_req = tensorS2GStates(17)
+  val s_shared_rsp = tensorS2GStates(18)
+  val s_tlb_req = tensorS2GStates(19)
+  val s_tlb_rsp = tensorS2GStates(20)
+  val s_l2_req = tensorS2GStates(21)
+  val s_l2_rsp = tensorS2GStates(22)
+  val s_complete = tensorS2GStates(23)
+  val s_addr_mul_start = tensorS2GStates(24)
+  val s_addr_mul_wait = tensorS2GStates(25)
+  val s_setup_mul_start = tensorS2GStates(26)
+  val s_setup_mul_wait = tensorS2GStates(27)
   val state = RegInit(s_idle)
 
   val sharedSrcReg = RegInit(0.U(xLen.W))
@@ -108,7 +105,6 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
   val asidReg = RegInit(0.U(SV32.asidLen.W))
   val pAddrReg = RegInit(0.U(SV32.paLen.W))
   val currentIdxReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
-  val currentCoordReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
   val outDimReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
   val outStrideBytesReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
   val sharedRowStrideReg = RegInit(VecInit(Seq.fill(5)(0.U(xLen.W))))
@@ -154,55 +150,6 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
 
   descByteStride(0) := Mux(descWordsReg(9) === 0.U, tensorDataWidth(descControl(3, 0)), descWordsReg(9))
   (1 until 5).foreach { i => descByteStride(i) := descWordsReg(9 + i) }
-  val descGlobalDim = Wire(Vec(5, UInt(xLen.W)))
-  (0 until 5).foreach { i => descGlobalDim(i) := descWordsReg(4 + i) }
-
-  def tensorLinearAddress(
-      base: UInt,
-      logicalCoord: Vec[UInt],
-      byteStride: Vec[UInt],
-      datawidth: UInt
-  ): UInt = {
-    base +
-      TmaPow2Math.scaleByDataWidth(logicalCoord(0), datawidth) +
-      logicalCoord(1) * byteStride(1) +
-      logicalCoord(2) * byteStride(2) +
-      logicalCoord(3) * byteStride(3) +
-      logicalCoord(4) * byteStride(4)
-  }
-
-  def tensorInterleaveAddress(
-      base: UInt,
-      logicalCoord: Vec[UInt],
-      rank: UInt,
-      globalDim: Vec[UInt],
-      byteStride: Vec[UInt],
-      interleaveMode: UInt
-  ): UInt = {
-    val sliceBytes = Mux(interleaveMode === 1.U, 16.U(xLen.W), 32.U(xLen.W))
-    // Tensor S2G v0 only accepts 4-byte elements, checked in s_setup.
-    val cSlice = Mux(interleaveMode === 1.U, logicalCoord(0) >> 2, logicalCoord(0) >> 3)
-    val cInSlice = Mux(
-      interleaveMode === 1.U,
-      logicalCoord(0)(1, 0).pad(xLen),
-      logicalCoord(0)(2, 0).pad(xLen)
-    )
-    val cSliceStride = Wire(UInt(xLen.W))
-    cSliceStride := sliceBytes
-    when(rank === 3.U) { cSliceStride := byteStride(1) * globalDim(1) }
-      .elsewhen(rank === 4.U) { cSliceStride := byteStride(2) * globalDim(2) }
-      .elsewhen(rank === 5.U) { cSliceStride := byteStride(3) * globalDim(3) }
-
-    base +
-      ((cInSlice << log2Ceil(dma_aligned_bulk))(xLen - 1, 0)) +
-      cSlice * cSliceStride +
-      logicalCoord(1) * byteStride(1) +
-      logicalCoord(2) * byteStride(2) +
-      logicalCoord(3) * byteStride(3) +
-      logicalCoord(4) * byteStride(4)
-  }
-
-  tvars.BoxAddress := descBoxAddressReg
   (0 until 5).foreach { i =>
     tvars.boxDim(i) := descWordsReg(14 + i)
     tvars.elementStrides(i) := Mux(descWordsReg(19 + i) === 0.U, 1.U, descWordsReg(19 + i))
@@ -677,7 +624,6 @@ class DmaTensorS2G(implicit p: Parameters) extends Module {
     }
     is(s_prepare) {
       (0 until 5).foreach { i =>
-        currentCoordReg(i) := currentCoord(i)
         currentIdxNextReg(i) := currentIdxNext(i)
         currentAdvanceDimOHReg(i) := currentAdvanceDimOH(i)
       }

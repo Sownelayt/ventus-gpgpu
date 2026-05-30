@@ -63,7 +63,6 @@ class DmaS2G(implicit p: Parameters) extends Module {
   val asidReg = RegInit(0.U(SV32.asidLen.W))
   val pAddrReg = RegInit(0.U(SV32.paLen.W))
   val chunkBytesReg = RegInit(0.U(xLen.W))
-  val laneMaskReg = RegInit(0.U(numgroupshared.W))
   val pendingReadMaskReg = RegInit(0.U(numgroupshared.W))
   val laneL2WordReg = Reg(Vec(numgroupshared, UInt(log2Ceil(dcache_BlockWords).W)))
   val laneByteMaskReg = Reg(Vec(numgroupshared, UInt(BytesOfWord.W)))
@@ -159,7 +158,6 @@ class DmaS2G(implicit p: Parameters) extends Module {
 
   when(state === s_shared_req && io.shared_req.fire) {
     chunkBytesReg := chunkBytes
-    laneMaskReg := laneMask
     pendingReadMaskReg := laneMask
     for (word <- 0 until dcache_BlockWords) {
       l2MaskReg(word) := 0.U
