@@ -31,6 +31,7 @@ class sExeData extends Bundle{
 
 class warpSchedulerExeData extends Bundle{
   val ctrl=new CtrlSigs()
+  val in1=UInt(xLen.W)
 }
 class csrExeData extends Bundle{
   val ctrl=new CtrlSigs()
@@ -83,6 +84,7 @@ class Issue extends Module{
     }
   }
   io.out_warpscheduler.bits.ctrl:=inputBuf.bits.ctrl
+  io.out_warpscheduler.bits.in1:=inputBuf.bits.in1(0)
   io.out_CSR.bits.ctrl:=inputBuf.bits.ctrl
   io.out_CSR.bits.in1:=inputBuf.bits.in1(0)
 
@@ -298,6 +300,7 @@ class IssueV2 extends Module {
     arb_CSR.io.in(i).bits.ctrl := inputBuf(i).bits.ctrl
     arb_CSR.io.in(i).bits.in1 := inputBuf(i).bits.in1(0)
     arb_warpscheduler.io.in(i).bits.ctrl := inputBuf(i).bits.ctrl
+    arb_warpscheduler.io.in(i).bits.in1 := inputBuf(i).bits.in1(0)
     arb_sALU.io.in(i).bits.in1 := inputBuf(i).bits.in1(0)
     arb_sALU.io.in(i).bits.in2 := inputBuf(i).bits.in2(0)
     arb_sALU.io.in(i).bits.in3 := inputBuf(i).bits.in3(0)

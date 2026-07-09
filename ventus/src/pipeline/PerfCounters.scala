@@ -25,10 +25,27 @@ class PipelinePerfCounters extends Bundle {
   val frontendStallCycles = UInt(64.W)
   val lsuBackpressureCycles = UInt(64.W)
   val ibufferFullCycles = UInt(64.W)
+  val dmaFenceWaitStallCycles = UInt(64.W)
 }
 
 class InstClassPerfCounters extends Bundle {
   val computeIssued = UInt(64.W)
   val memIssued = UInt(64.W)
   val ctrlIssued = UInt(64.W)
+}
+
+class S2GPerfCounters extends Bundle {
+  val instIssued = UInt(64.W)
+  val lineIssued = UInt(64.W)
+  val putFull = UInt(64.W)
+  val putPart = UInt(64.W)
+  val bytesWritten = UInt(64.W)
+  val sharedReadReq = UInt(64.W)
+  val sharedReadRsp = UInt(64.W)
+  val tlbReq = UInt(64.W)
+  val ackCount = UInt(64.W)
+  val ackLatencySum = UInt(64.W)
+  val lineFullStallCycles = UInt(64.W)
+  val readEntryFullStallCycles = UInt(64.W)
+  val ackTagFullStallCycles = UInt(64.W)
 }

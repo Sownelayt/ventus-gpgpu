@@ -225,6 +225,9 @@ class CSRFile extends Module {
   val vtype = Cat(VILL,0.U(23.W),VMA,VTA,VSEW,VLMUL)
   val vlenb = RegInit(0.U(xLen.W))
 
+  val mcycleCounter = RegInit(0.U(64.W))
+  mcycleCounter := mcycleCounter + 1.U
+
   val csr_addr = io.ctrl.inst(31,20)
   val csr_input = io.in1
   val csr_rdata = Wire(UInt(xLen.W))
@@ -254,6 +257,8 @@ class CSRFile extends Module {
     BitPat(CSR.mcause)          -> mcause,
     BitPat(CSR.mtval)           -> mtval,
     BitPat(CSR.mip)             -> mip,
+    BitPat(CSR.mcycle)          -> mcycleCounter(31, 0),
+    BitPat(CSR.mcycleh)         -> mcycleCounter(63, 32),
     BitPat(CSR.frm)->frm,
     BitPat(CSR.fcsr)->fcsr,
     BitPat(CSR.fflags)->fflags,

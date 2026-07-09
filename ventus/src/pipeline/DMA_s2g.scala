@@ -1,9 +1,9 @@
 /*
  * Shared-memory to global-memory DMA datapath for CP_ASYNC_BULK_S2G.
  *
- * First implementation is intentionally serial: one S2G instruction owns the
- * path, each chunk reads a contiguous shared-memory span, translates the global
- * destination line, issues one L2 Put, and completes only after the L2 ack.
+ * This implementation keeps the external DMA_core interface unchanged, but
+ * internally uses bounded line/read/ack entries so shared reads, TLB requests,
+ * L2 Puts, and AccessAck completion can overlap.
  */
 package pipeline
 
@@ -21,16 +21,36 @@ class DmaSharedRsp extends Bundle {
   val activeMask = Vec(num_thread, Bool())
 }
 
+class S2GLineTask extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val group = UInt(log2Ceil(dma_group_entries).W)
+  val asid = UInt(SV32.asidLen.W)
+  val src = UInt(xLen.W)
+  val dst = UInt(xLen.W)
+  val bytes = UInt(xLen.W)
+  val dstWordStride = UInt(log2Ceil(dcache_BlockWords + 1).W)
+  val swizzleMode = UInt(2.W)
+  val swizzleBase = UInt(xLen.W)
+  val swizzleRow = UInt(3.W)
+  val earlyRelease = Bool()
+  val first = Bool()
+  val last = Bool()
+}
+
 class DmaS2G(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
     val from_fifo = Flipped(DecoupledIO(new vExeData))
+    val line_task = Flipped(DecoupledIO(new S2GLineTask))
     val shared_req = DecoupledIO(new ShareMemCoreReq_np)
     val shared_rsp = Flipped(DecoupledIO(new DmaSharedRsp))
     val to_l2TLB = DecoupledIO(new L1TlbReq(SV32))
     val from_l2TLB = Flipped(DecoupledIO(new L1TlbRsp(SV32)))
     val to_l2cache = DecoupledIO(new DCacheMemReq_p)
     val from_l2cache = Flipped(DecoupledIO(new DCacheMemRsp))
-    val inst_complete = DecoupledIO(UInt(depth_warp.W))
+    val inst_complete = DecoupledIO(new DmaCompletion)
+    val perfEnable = Input(Bool())
+    val perfReset = Input(Bool())
+    val perf = if (PMU_DMA_S2G) Some(Output(new S2GPerfCounters)) else None
   })
 
   val lineOffsetBits = log2Ceil(l2cacheline)
@@ -39,6 +59,29 @@ class DmaS2G(implicit p: Parameters) extends Module {
   val sharedSetIdxLo = dcache_BlockOffsetBits + dcache_WordOffsetBits
   val dmaSourceLowBits = l1cache_sourceBits - log2Ceil(max_dma_tag) - log2Ceil(max_dma_inst)
   require(dmaSourceLowBits > 1, "DMA S2G source encoding needs a distinct non-meta low-bit pattern")
+  require(lsu_nMshrEntry > 2, "DMA S2G dynamic shared-read IDs reserve 0/1 for legacy bulk/tensor routing")
+
+  val lineEntries = s2g_line_entries
+  val ackEntries = s2g_completion_entries
+  val readIdBase = 2
+  val readEntries = {
+    val available = lsu_nMshrEntry - readIdBase
+    if (s2g_shared_read_entries < available) s2g_shared_read_entries else available
+  }
+  require(lineEntries > 0, "DMA S2G needs at least one line entry")
+  require(readEntries > 0, "DMA S2G needs at least one shared-read entry")
+  require(ackEntries > 0, "DMA S2G needs at least one completion entry")
+  require(ackEntries <= max_dma_tag, "DMA S2G completion entries must fit in the DMA source tag field")
+  require((ackEntries & (ackEntries - 1)) == 0, "DMA S2G completion entries must be a power of two")
+
+  val lineIdxWidth = log2Ceil(lineEntries).max(1)
+  val readIdxWidth = log2Ceil(readEntries).max(1)
+  val instIdxWidth = log2Ceil(max_dma_inst).max(1)
+  val tagIdxWidth = log2Ceil(ackEntries).max(1)
+  val ackSourceBase = dmaSourceLowBits + instIdxWidth
+  val ackSourcePadBits = l1cache_sourceBits - ackSourceBase - tagIdxWidth
+  require(ackSourcePadBits >= 0, "DMA S2G completion source encoding overflows d_source")
+  val wordIdxWidth = log2Ceil(dcache_BlockWords).max(1)
 
   def alignToL2Line(addr: UInt): UInt =
     Cat(addr(xLen - 1, lineOffsetBits), 0.U(lineOffsetBits.W))
@@ -49,176 +92,653 @@ class DmaS2G(implicit p: Parameters) extends Module {
   def sharedBlockOffset(addr: UInt): UInt =
     addr(dcache_BlockOffsetBits + dcache_WordOffsetBits - 1, dcache_WordOffsetBits)
 
+  def swizzleSharedAddr(logicalAddr: UInt, baseAddr: UInt, mode: UInt, rowLow: UInt): UInt = {
+    val rel = logicalAddr - baseAddr
+    val rel32 = Cat(rel(xLen - 1, 5), rel(4) ^ rowLow(0), rel(3, 0))
+    val rel64 = Cat(rel(xLen - 1, 6), rel(5, 4) ^ rowLow(1, 0), rel(3, 0))
+    val rel128 = Cat(rel(xLen - 1, 7), rel(6, 4) ^ rowLow(2, 0), rel(3, 0))
+    baseAddr + MuxLookup(mode, rel)(Seq(
+      1.U -> rel32,
+      2.U -> rel64,
+      3.U -> rel128
+    ))
+  }
+
   def minUInt(a: UInt, b: UInt): UInt = Mux(a < b, a, b)
 
-  val (s_idle :: s_shared_req :: s_shared_rsp :: s_tlb_req :: s_tlb_rsp ::
-    s_l2_req :: s_l2_rsp :: s_complete :: Nil) = Enum(8)
-  val state = RegInit(s_idle)
+  // Instruction table.
+  val instValid = RegInit(VecInit(Seq.fill(max_dma_inst)(false.B)))
+  val instWid = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(depth_warp.W))))
+  val instGroup = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(log2Ceil(dma_group_entries).W))))
+  val instAsid = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(SV32.asidLen.W))))
+  val instSrc = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instDst = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instSize = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instOffset = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instExternal = RegInit(VecInit(Seq.fill(max_dma_inst)(false.B)))
+  val instAddrDone = RegInit(VecInit(Seq.fill(max_dma_inst)(false.B)))
+  val instPendingLines = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instComplete = RegInit(VecInit(Seq.fill(max_dma_inst)(false.B)))
+  val instSeq = RegInit(VecInit(Seq.fill(max_dma_inst)(0.U(xLen.W))))
+  val instSeqNext = RegInit(0.U(xLen.W))
+  val extInstActive = RegInit(false.B)
+  val extInstIdx = RegInit(0.U(instIdxWidth.W))
 
-  val srcReg = RegInit(0.U(xLen.W))
-  val dstReg = RegInit(0.U(xLen.W))
-  val sizeReg = RegInit(0.U(xLen.W))
-  val offsetReg = RegInit(0.U(xLen.W))
-  val widReg = RegInit(0.U(depth_warp.W))
-  val asidReg = RegInit(0.U(SV32.asidLen.W))
-  val pAddrReg = RegInit(0.U(SV32.paLen.W))
-  val chunkBytesReg = RegInit(0.U(xLen.W))
-  val pendingReadMaskReg = RegInit(0.U(numgroupshared.W))
-  val laneL2WordReg = Reg(Vec(numgroupshared, UInt(log2Ceil(dcache_BlockWords).W)))
-  val laneByteMaskReg = Reg(Vec(numgroupshared, UInt(BytesOfWord.W)))
-  val l2MaskReg = Reg(Vec(dcache_BlockWords, UInt(BytesOfWord.W)))
-  val l2DataReg = Reg(Vec(dcache_BlockWords, UInt(xLen.W)))
+  // Line table. The 128B line image is the dominant storage; metadata stays in
+  // flops, while line data is kept in word-banked SyncReadMem below.
+  val lineValid = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineInst = RegInit(VecInit(Seq.fill(lineEntries)(0.U(instIdxWidth.W))))
+  val lineSrc = RegInit(VecInit(Seq.fill(lineEntries)(0.U(xLen.W))))
+  val lineDstVaddr = RegInit(VecInit(Seq.fill(lineEntries)(0.U(xLen.W))))
+  val linePaddr = RegInit(VecInit(Seq.fill(lineEntries)(0.U(SV32.paLen.W))))
+  val linePaddrValid = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineTlbReq = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineDstStartWord = RegInit(VecInit(Seq.fill(lineEntries)(0.U(wordIdxWidth.W))))
+  val lineBytes = RegInit(VecInit(Seq.fill(lineEntries)(0.U(xLen.W))))
+  val lineDstWordStride = RegInit(VecInit(Seq.fill(lineEntries)(1.U(log2Ceil(dcache_BlockWords + 1).W))))
+  val lineReadIssued = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineSharedDone = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val linePutIssued = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineSeq = RegInit(VecInit(Seq.fill(lineEntries)(0.U(xLen.W))))
+  val lineSwizzleMode = RegInit(VecInit(Seq.fill(lineEntries)(0.U(2.W))))
+  val lineSwizzleBase = RegInit(VecInit(Seq.fill(lineEntries)(0.U(xLen.W))))
+  val lineSwizzleRow = RegInit(VecInit(Seq.fill(lineEntries)(0.U(3.W))))
+  val lineEarlyRelease = RegInit(VecInit(Seq.fill(lineEntries)(false.B)))
+  val lineMask = RegInit(VecInit(Seq.fill(lineEntries)(
+    VecInit(Seq.fill(dcache_BlockWords)(0.U(BytesOfWord.W)))
+  )))
+  val lineSeqNext = RegInit(0.U(xLen.W))
+  val lineDataMem = Seq.fill(dcache_BlockWords)(SyncReadMem(lineEntries, UInt(xLen.W)))
 
-  val curSrc = srcReg + offsetReg
-  val curDst = dstReg + offsetReg
-  val dstLineBase = alignToL2Line(curDst)
-  val bytesLeft = sizeReg - offsetReg
-  val bytesToDstLine = l2cacheline.U - curDst(lineOffsetBits - 1, 0)
-  val bytesToSrcLine = l2cacheline.U - curSrc(lineOffsetBits - 1, 0)
-  val bytesPerSharedReq = (numgroupshared * dma_aligned_bulk).U
-  val chunkBytes = minUInt(bytesLeft, minUInt(bytesToDstLine, minUInt(bytesToSrcLine, bytesPerSharedReq)))
-  val dstStartWord = curDst(lineOffsetBits - 1, wordOffsetBits)
+  val putReadPending = RegInit(false.B)
+  val putReadLine = RegInit(0.U(lineIdxWidth.W))
+  val putDataValid = RegInit(false.B)
+  val putDataLine = RegInit(0.U(lineIdxWidth.W))
+  val putDataVec = Reg(Vec(dcache_BlockWords, UInt(xLen.W)))
 
-  val laneByteMask = Wire(Vec(numgroupshared, UInt(BytesOfWord.W)))
-  val laneActive = Wire(Vec(numgroupshared, Bool()))
-  for (lane <- 0 until numgroupshared) {
-    val maskBits = Wire(Vec(BytesOfWord, Bool()))
-    for (byte <- 0 until BytesOfWord) {
-      maskBits(byte) := (lane.U * dma_aligned_bulk.U + byte.U) < chunkBytes
-    }
-    laneByteMask(lane) := maskBits.asUInt
-    laneActive(lane) := laneByteMask(lane).orR
+  // Shared read table. instrId 0/1 are left to existing routes; bulk S2G uses
+  // IDs [2, lsu_nMshrEntry).
+  val readValid = RegInit(VecInit(Seq.fill(readEntries)(false.B)))
+  val readLine = RegInit(VecInit(Seq.fill(readEntries)(0.U(lineIdxWidth.W))))
+  val readPendingMask = RegInit(VecInit(Seq.fill(readEntries)(0.U(numgroupshared.W))))
+  val readLaneWord = RegInit(VecInit(Seq.fill(readEntries)(
+    VecInit(Seq.fill(numgroupshared)(0.U(wordIdxWidth.W)))
+  )))
+  val readLaneMask = RegInit(VecInit(Seq.fill(readEntries)(
+    VecInit(Seq.fill(numgroupshared)(0.U(BytesOfWord.W)))
+  )))
+
+  // L2 Put ack table.
+  val ackValid = RegInit(VecInit(Seq.fill(ackEntries)(false.B)))
+  val ackInst = RegInit(VecInit(Seq.fill(ackEntries)(0.U(instIdxWidth.W))))
+  val ackLine = RegInit(VecInit(Seq.fill(ackEntries)(0.U(lineIdxWidth.W))))
+  val ackReleaseLine = RegInit(VecInit(Seq.fill(ackEntries)(false.B)))
+
+  val perfCycle = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) Some(RegInit(0.U(64.W))) else None
+  val perfAckIssueCycle = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) {
+    Some(RegInit(VecInit(Seq.fill(ackEntries)(0.U(64.W)))))
+  } else {
+    None
   }
-  val laneMask = laneActive.asUInt
+  val perfInstIssued = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfLineIssued = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfPutFull = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfPutPart = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfBytesWritten = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfSharedReadReq = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfSharedReadRsp = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfTlbReq = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfAckCount = if (PMU_DMA_S2G) Some(RegInit(0.U(64.W))) else None
+  val perfAckLatencySum = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) Some(RegInit(0.U(64.W))) else None
+  val perfLineFullStallCycles = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) Some(RegInit(0.U(64.W))) else None
+  val perfReadEntryFullStallCycles = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) Some(RegInit(0.U(64.W))) else None
+  val perfAckTagFullStallCycles = if (PMU_DMA_S2G && PMU_DMA_S2G_DETAIL) Some(RegInit(0.U(64.W))) else None
 
-  val sharedReqAddr = Wire(Vec(numgroupshared, UInt(xLen.W)))
-  for (lane <- 0 until numgroupshared) {
-    sharedReqAddr(lane) := curSrc + (lane.U << wordOffsetBits)
-  }
-
-  io.from_fifo.ready := state === s_idle
-
-  io.shared_req.valid := state === s_shared_req
-  io.shared_req.bits.instrId := 0.U
-  io.shared_req.bits.isWrite := false.B
-  io.shared_req.bits.setIdx := sharedSetIdx(curSrc)
-  for (lane <- 0 until numgroupshared) {
-    io.shared_req.bits.perLaneAddr(lane).activeMask := laneActive(lane)
-    io.shared_req.bits.perLaneAddr(lane).blockOffset := sharedBlockOffset(sharedReqAddr(lane))
-    io.shared_req.bits.perLaneAddr(lane).wordOffset1H := Fill(BytesOfWord, 1.U)
-    io.shared_req.bits.data(lane) := 0.U
-  }
-
-  io.shared_rsp.ready := state === s_shared_rsp
-
-  io.to_l2TLB.valid := state === s_tlb_req
-  io.to_l2TLB.bits.vaddr := dstLineBase
-  io.to_l2TLB.bits.asid := asidReg
-  io.from_l2TLB.ready := state === s_tlb_rsp
+  val tlbBusy = RegInit(false.B)
+  val tlbLineReg = RegInit(0.U(lineIdxWidth.W))
 
   val fullWordMask = Fill(BytesOfWord, 1.U)
-  val isFullLinePut = l2MaskReg.map(_ === fullWordMask).reduce(_ && _)
-  val s2gSource = Cat(
-    0.U(log2Ceil(max_dma_tag).W),
-    0.U(log2Ceil(max_dma_inst).W),
-    2.U(dmaSourceLowBits.W)
-  )
 
-  io.to_l2cache.valid := state === s_l2_req
-  io.to_l2cache.bits.a_opcode := Mux(isFullLinePut, 0.U, 1.U)
-  io.to_l2cache.bits.a_param := 0.U
-  io.to_l2cache.bits.a_source := s2gSource
-  io.to_l2cache.bits.a_addr.foreach(_ := pAddrReg)
-  io.to_l2cache.bits.a_data := l2DataReg
-  io.to_l2cache.bits.a_mask := l2MaskReg
-  io.to_l2cache.bits.spike_info.foreach(_ := io.to_l2cache.bits.defaultSpikeInfo)
+  val freeInstVec = VecInit((0 until max_dma_inst).map(i => !instValid(i)))
+  val freeInstValid = freeInstVec.asUInt.orR
+  val freeInstIdx = PriorityEncoder(freeInstVec)
 
-  io.from_l2cache.ready := state === s_l2_rsp
+  val freeLineVec = VecInit((0 until lineEntries).map(i => !lineValid(i)))
+  val freeLineValid = freeLineVec.asUInt.orR
+  val freeLineIdx = PriorityEncoder(freeLineVec)
 
-  io.inst_complete.valid := state === s_complete
-  io.inst_complete.bits := widReg
+  val freeReadVec = VecInit((0 until readEntries).map(i => !readValid(i)))
+  val freeReadValid = freeReadVec.asUInt.orR
+  val freeReadIdx = PriorityEncoder(freeReadVec)
 
-  when(state === s_idle && io.from_fifo.fire) {
-    srcReg := io.from_fifo.bits.in1(0)
-    dstReg := io.from_fifo.bits.in3(0)
-    sizeReg := io.from_fifo.bits.in2(0)
-    offsetReg := 0.U
-    widReg := io.from_fifo.bits.ctrl.wid
-    asidReg := io.from_fifo.bits.ctrl.asid.getOrElse(0.U)
+  val freeAckVec = VecInit((0 until ackEntries).map(i => !ackValid(i)))
+  val freeAckValid = freeAckVec.asUInt.orR
+  val freeAckIdx = PriorityEncoder(freeAckVec)
+
+  // -----------------------------
+  // Instruction accept
+  // -----------------------------
+  val tensorTaskNeedsInst = io.line_task.bits.first && !extInstActive
+  val tensorTaskInstAvailable = Mux(tensorTaskNeedsInst, freeInstValid, extInstActive)
+  io.line_task.ready := freeLineValid && tensorTaskInstAvailable
+  val tensorTaskFire = io.line_task.fire
+  val tensorTaskInstIdx = Mux(tensorTaskNeedsInst, freeInstIdx, extInstIdx)
+  val tensorTaskAllocInst = tensorTaskFire && tensorTaskNeedsInst
+
+  // Tensor line tasks use the same bounded writeback backend. Give a new
+  // tensor task first priority for the shared instruction-table entry so it
+  // cannot race a bulk S2G accept on the same free slot.
+  io.from_fifo.ready := freeInstValid && !(io.line_task.valid && tensorTaskNeedsInst)
+  val inputFire = io.from_fifo.fire
+  when(inputFire) {
+    instValid(freeInstIdx) := true.B
+    instWid(freeInstIdx) := io.from_fifo.bits.ctrl.wid
+    instGroup(freeInstIdx) := io.from_fifo.bits.ctrl.dma_group
+    instAsid(freeInstIdx) := io.from_fifo.bits.ctrl.asid.getOrElse(0.U)
+    instSrc(freeInstIdx) := io.from_fifo.bits.in1(0)
+    instDst(freeInstIdx) := io.from_fifo.bits.in3(0)
+    instSize(freeInstIdx) := io.from_fifo.bits.in2(0)
+    instOffset(freeInstIdx) := 0.U
+    instExternal(freeInstIdx) := false.B
+    instPendingLines(freeInstIdx) := 0.U
+    instAddrDone(freeInstIdx) := io.from_fifo.bits.in2(0) === 0.U
+    instComplete(freeInstIdx) := io.from_fifo.bits.in2(0) === 0.U
+    instSeq(freeInstIdx) := instSeqNext
+    instSeqNext := instSeqNext + 1.U
     when(!reset.asBool) {
       assert(io.from_fifo.bits.ctrl.funct === 3.U,
-        "DMA S2G datapath received a non-S2G instruction")
+        "DMA S2G datapath received a non-bulk-S2G instruction")
       assert(io.from_fifo.bits.in1(0)(wordOffsetBits - 1, 0) === 0.U &&
              io.from_fifo.bits.in3(0)(wordOffsetBits - 1, 0) === 0.U &&
              io.from_fifo.bits.in2(0)(wordOffsetBits - 1, 0) === 0.U,
         "DMA S2G requires 4-byte aligned src, dst, and size")
     }
-    state := Mux(io.from_fifo.bits.in2(0) === 0.U, s_complete, s_shared_req)
+  }
+  when(tensorTaskAllocInst) {
+    instValid(freeInstIdx) := true.B
+    instWid(freeInstIdx) := io.line_task.bits.wid
+    instGroup(freeInstIdx) := io.line_task.bits.group
+    instAsid(freeInstIdx) := io.line_task.bits.asid
+    instSrc(freeInstIdx) := io.line_task.bits.src
+    instDst(freeInstIdx) := io.line_task.bits.dst
+    instSize(freeInstIdx) := 0.U
+    instOffset(freeInstIdx) := 0.U
+    instExternal(freeInstIdx) := true.B
+    instPendingLines(freeInstIdx) := 0.U
+    instAddrDone(freeInstIdx) := io.line_task.bits.last
+    instComplete(freeInstIdx) := false.B
+    instSeq(freeInstIdx) := instSeqNext
+    instSeqNext := instSeqNext + 1.U
+    when(!io.line_task.bits.last) {
+      extInstActive := true.B
+      extInstIdx := freeInstIdx
+    }
+  }.elsewhen(tensorTaskFire && io.line_task.bits.last) {
+    extInstActive := false.B
+    instAddrDone(tensorTaskInstIdx) := true.B
+  }
+  when(!reset.asBool && tensorTaskFire) {
+    assert(io.line_task.bits.bytes =/= 0.U,
+      "DMA S2G backend received an empty tensor line task")
+    assert(io.line_task.bits.src(wordOffsetBits - 1, 0) === 0.U &&
+           io.line_task.bits.dst(wordOffsetBits - 1, 0) === 0.U &&
+           io.line_task.bits.bytes(wordOffsetBits - 1, 0) === 0.U,
+      "DMA S2G tensor line task currently requires 4-byte aligned src, dst, and size")
+    assert(io.line_task.bits.first || extInstActive,
+      "DMA S2G backend received a non-first tensor task without an active tensor instruction")
+    assert(!(io.line_task.bits.first && extInstActive),
+      "DMA S2G backend received a new tensor first task before the previous tensor instruction ended")
   }
 
-  when(state === s_shared_req && io.shared_req.fire) {
-    chunkBytesReg := chunkBytes
-    pendingReadMaskReg := laneMask
-    for (word <- 0 until dcache_BlockWords) {
-      l2MaskReg(word) := 0.U
-      l2DataReg(word) := 0.U
+  // -----------------------------
+  // Bulk address generation -> line allocation
+  // -----------------------------
+  val genInstVec = VecInit((0 until max_dma_inst).map(i =>
+    instValid(i) && !instExternal(i) && !instAddrDone(i) && !instComplete(i)
+  ))
+  val genInstValid = genInstVec.asUInt.orR
+  val genInstIdx = PriorityEncoder(genInstVec)
+  val genSrcCur = instSrc(genInstIdx) + instOffset(genInstIdx)
+  val genDstCur = instDst(genInstIdx) + instOffset(genInstIdx)
+  val genBytesLeft = instSize(genInstIdx) - instOffset(genInstIdx)
+  val genBytesToDstLine = l2cacheline.U - genDstCur(lineOffsetBits - 1, 0)
+  val genBytesToSrcLine = l2cacheline.U - genSrcCur(lineOffsetBits - 1, 0)
+  val genBytesPerSharedReq = (numgroupshared * dma_aligned_bulk).U
+  val genChunkBytes = minUInt(genBytesLeft,
+    minUInt(genBytesToDstLine, minUInt(genBytesToSrcLine, genBytesPerSharedReq)))
+  val genOffsetNext = instOffset(genInstIdx) + genChunkBytes
+  val bulkLineAllocFire = genInstValid && freeLineValid && !tensorTaskFire
+  val lineAllocFire = bulkLineAllocFire || tensorTaskFire
+  val lineAllocInstIdx = Mux(tensorTaskFire, tensorTaskInstIdx, genInstIdx)
+
+  when(lineAllocFire) {
+    val idx = freeLineIdx
+    lineValid(idx) := true.B
+    lineInst(idx) := lineAllocInstIdx
+    lineSrc(idx) := Mux(tensorTaskFire, io.line_task.bits.src, genSrcCur)
+    lineDstVaddr(idx) := alignToL2Line(Mux(tensorTaskFire, io.line_task.bits.dst, genDstCur))
+    linePaddr(idx) := 0.U
+    linePaddrValid(idx) := false.B
+    lineTlbReq(idx) := false.B
+    lineDstStartWord(idx) := Mux(tensorTaskFire, io.line_task.bits.dst, genDstCur)(lineOffsetBits - 1, wordOffsetBits)
+    lineBytes(idx) := Mux(tensorTaskFire, io.line_task.bits.bytes, genChunkBytes)
+    lineDstWordStride(idx) := Mux(tensorTaskFire, io.line_task.bits.dstWordStride, 1.U)
+    lineReadIssued(idx) := false.B
+    lineSharedDone(idx) := false.B
+    linePutIssued(idx) := false.B
+    lineSeq(idx) := lineSeqNext
+    lineSwizzleMode(idx) := Mux(tensorTaskFire, io.line_task.bits.swizzleMode, 0.U)
+    lineSwizzleBase(idx) := Mux(tensorTaskFire, io.line_task.bits.swizzleBase, 0.U)
+    lineSwizzleRow(idx) := Mux(tensorTaskFire, io.line_task.bits.swizzleRow, 0.U)
+    lineEarlyRelease(idx) := Mux(tensorTaskFire, io.line_task.bits.earlyRelease, true.B)
+    lineSeqNext := lineSeqNext + 1.U
+    for (w <- 0 until dcache_BlockWords) {
+      lineMask(idx)(w) := 0.U
     }
+    when(!tensorTaskFire) {
+      instOffset(genInstIdx) := genOffsetNext
+      when(genOffsetNext >= instSize(genInstIdx)) {
+        instAddrDone(genInstIdx) := true.B
+      }
+    }
+  }
+
+  // -----------------------------
+  // Shared read issue
+  // -----------------------------
+  val readIssueLineVec = VecInit((0 until lineEntries).map(i =>
+    lineValid(i) && !lineReadIssued(i)
+  ))
+  val readIssueLineValid = readIssueLineVec.asUInt.orR
+  val readIssueLineIdx = PriorityEncoder(readIssueLineVec)
+  val readIssueFire = io.shared_req.fire
+
+  val issueLineBytes = lineBytes(readIssueLineIdx)
+  val issueLineDstStartWord = lineDstStartWord(readIssueLineIdx)
+  val issueLineDstWordStride = lineDstWordStride(readIssueLineIdx)
+  val issueSwizzleMode = lineSwizzleMode(readIssueLineIdx)
+  val issueSwizzleBase = lineSwizzleBase(readIssueLineIdx)
+  val issueSwizzleRow = lineSwizzleRow(readIssueLineIdx)
+  val issueLaneByteMask = Wire(Vec(numgroupshared, UInt(BytesOfWord.W)))
+  val issueLaneActive = Wire(Vec(numgroupshared, Bool()))
+  val issueLaneWord = Wire(Vec(numgroupshared, UInt(wordIdxWidth.W)))
+  val issueSharedAddr = Wire(Vec(numgroupshared, UInt(xLen.W)))
+  for (lane <- 0 until numgroupshared) {
+    val rawSharedAddr = lineSrc(readIssueLineIdx) + (lane.U << wordOffsetBits)
+    val maskBits = Wire(Vec(BytesOfWord, Bool()))
+    for (byte <- 0 until BytesOfWord) {
+      maskBits(byte) := (lane.U * dma_aligned_bulk.U + byte.U) < issueLineBytes
+    }
+    issueLaneByteMask(lane) := maskBits.asUInt
+    issueLaneActive(lane) := issueLaneByteMask(lane).orR
+    issueLaneWord(lane) := (
+      issueLineDstStartWord + TmaPow2Math.scaleByPow2(lane.U(xLen.W), issueLineDstWordStride)
+    )(wordIdxWidth - 1, 0)
+    issueSharedAddr(lane) := Mux(
+      issueSwizzleMode === 0.U,
+      rawSharedAddr,
+      swizzleSharedAddr(rawSharedAddr, issueSwizzleBase, issueSwizzleMode, issueSwizzleRow)
+    )
+  }
+  val issueLaneMask = issueLaneActive.asUInt
+
+  io.shared_req.valid := readIssueLineValid && freeReadValid
+  io.shared_req.bits.instrId := (freeReadIdx + readIdBase.U)(log2Up(lsu_nMshrEntry) - 1, 0)
+  io.shared_req.bits.isWrite := false.B
+  io.shared_req.bits.setIdx := sharedSetIdx(issueSharedAddr(0))
+  for (lane <- 0 until numgroupshared) {
+    io.shared_req.bits.perLaneAddr(lane).activeMask := issueLaneActive(lane)
+    io.shared_req.bits.perLaneAddr(lane).blockOffset := sharedBlockOffset(issueSharedAddr(lane))
+    io.shared_req.bits.perLaneAddr(lane).wordOffset1H := Fill(BytesOfWord, 1.U)
+    io.shared_req.bits.data(lane) := 0.U
+  }
+
+  when(readIssueFire) {
+    readValid(freeReadIdx) := true.B
+    readLine(freeReadIdx) := readIssueLineIdx
+    readPendingMask(freeReadIdx) := issueLaneMask
     for (lane <- 0 until numgroupshared) {
-      val l2Word = dstStartWord + lane.U
-      laneL2WordReg(lane) := l2Word(log2Ceil(dcache_BlockWords) - 1, 0)
-      laneByteMaskReg(lane) := laneByteMask(lane)
+      readLaneWord(freeReadIdx)(lane) := issueLaneWord(lane)
+      readLaneMask(freeReadIdx)(lane) := issueLaneByteMask(lane)
     }
-    state := s_shared_rsp
+    lineReadIssued(readIssueLineIdx) := true.B
+    when(!reset.asBool) {
+      for (lane <- 0 until numgroupshared) {
+        when(issueLaneActive(lane)) {
+          assert(sharedSetIdx(issueSharedAddr(lane)) === sharedSetIdx(issueSharedAddr(0)),
+            "DMA S2G swizzled line task crossed a shared-memory set")
+        }
+      }
+    }
   }
 
-  when(state === s_shared_rsp && io.shared_rsp.fire) {
-    val rspMask = io.shared_rsp.bits.activeMask.asUInt
-    val pendingNext = pendingReadMaskReg & ~rspMask
+  // -----------------------------
+  // Shared read response collect
+  // -----------------------------
+  io.shared_rsp.ready := true.B
+  val rspReadIdx = (io.shared_rsp.bits.instrId - readIdBase.U)(readIdxWidth - 1, 0)
+  val rspLineIdx = readLine(rspReadIdx)
+  val rspMask = io.shared_rsp.bits.activeMask.asUInt
+  val rspPendingNext = readPendingMask(rspReadIdx) & ~rspMask
+  val rspLineMaskNext = Wire(Vec(dcache_BlockWords, UInt(BytesOfWord.W)))
+  for (w <- 0 until dcache_BlockWords) {
+    rspLineMaskNext(w) := lineMask(rspLineIdx)(w)
+  }
+  for (lane <- 0 until numgroupshared) {
+    when(io.shared_rsp.bits.activeMask(lane)) {
+      rspLineMaskNext(readLaneWord(rspReadIdx)(lane)) :=
+        lineMask(rspLineIdx)(readLaneWord(rspReadIdx)(lane)) | readLaneMask(rspReadIdx)(lane)
+    }
+  }
+  for (w <- 0 until dcache_BlockWords) {
+    val wordHitVec = VecInit((0 until numgroupshared).map(lane =>
+      io.shared_rsp.bits.activeMask(lane) && readLaneWord(rspReadIdx)(lane) === w.U
+    ))
+    val wordHit = wordHitVec.asUInt.orR
+    val wordData = Mux1H(wordHitVec, io.shared_rsp.bits.data)
+    when(io.shared_rsp.fire && wordHit) {
+      lineDataMem(w).write(rspLineIdx, wordData)
+    }
+  }
+  when(io.shared_rsp.fire) {
     when(!reset.asBool) {
       assert(!io.shared_rsp.bits.isWrite,
         "DMA S2G shared response must be a read response")
-      assert((rspMask & ~pendingReadMaskReg) === 0.U,
+      assert(readValid(rspReadIdx),
+        "DMA S2G shared response used an invalid read entry")
+      assert((rspMask & ~readPendingMask(rspReadIdx)) === 0.U,
         "DMA S2G shared response returned lanes that were not pending")
     }
-    for (lane <- 0 until numgroupshared) {
-      when(io.shared_rsp.bits.activeMask(lane)) {
-        l2DataReg(laneL2WordReg(lane)) := io.shared_rsp.bits.data(lane)
-        l2MaskReg(laneL2WordReg(lane)) := laneByteMaskReg(lane)
+    lineMask(rspLineIdx) := rspLineMaskNext
+    readPendingMask(rspReadIdx) := rspPendingNext
+    when(rspPendingNext === 0.U) {
+      readValid(rspReadIdx) := false.B
+      lineSharedDone(rspLineIdx) := true.B
+    }
+  }
+
+  // -----------------------------
+  // TLB/page translation
+  // -----------------------------
+  val tlbLineVec = VecInit((0 until lineEntries).map(i =>
+    lineValid(i) && !linePaddrValid(i) && !lineTlbReq(i)
+  ))
+  val tlbLineValid = tlbLineVec.asUInt.orR
+  val tlbLineIdx = PriorityEncoder(tlbLineVec)
+  val tlbLineInstIdx = lineInst(tlbLineIdx)
+  val tlbAsid = instAsid(tlbLineInstIdx)
+
+  io.to_l2TLB.valid := tlbLineValid && !tlbBusy
+  io.to_l2TLB.bits.vaddr := lineDstVaddr(tlbLineIdx)
+  io.to_l2TLB.bits.asid := tlbAsid
+  io.from_l2TLB.ready := tlbBusy
+
+  when(io.to_l2TLB.fire) {
+    tlbBusy := true.B
+    tlbLineReg := tlbLineIdx
+    lineTlbReq(tlbLineIdx) := true.B
+  }
+
+  when(io.from_l2TLB.fire) {
+    tlbBusy := false.B
+    linePaddr(tlbLineReg) := io.from_l2TLB.bits.paddr
+    linePaddrValid(tlbLineReg) := true.B
+  }
+
+  // -----------------------------
+  // L2 Put issue
+  // -----------------------------
+  val putLineVec = VecInit((0 until lineEntries).map(i =>
+    lineValid(i) && lineSharedDone(i) && linePaddrValid(i) &&
+      !linePutIssued(i) &&
+      !(putDataValid && putDataLine === i.U) &&
+      !(putReadPending && putReadLine === i.U)
+  ))
+  val putLineValid = putLineVec.asUInt.orR
+  val putLineIdx = PriorityEncoder(putLineVec)
+  val putReadStart = !putReadPending && !putDataValid && putLineValid
+  val putDataRead = VecInit((0 until dcache_BlockWords).map(w =>
+    lineDataMem(w).read(putLineIdx, putReadStart)
+  ))
+
+  when(putReadStart) {
+    putReadPending := true.B
+    putReadLine := putLineIdx
+  }
+
+  when(putReadPending) {
+    putReadPending := false.B
+    putDataValid := true.B
+    putDataLine := putReadLine
+    putDataVec := putDataRead
+  }
+
+  val putDataMask = lineMask(putDataLine)
+  val putDataFullLine = VecInit((0 until dcache_BlockWords).map(w =>
+    putDataMask(w) === fullWordMask
+  )).asUInt.andR
+  val putDataHasBytes = VecInit((0 until dcache_BlockWords).map(w =>
+    putDataMask(w).orR
+  )).asUInt.orR
+  val putDataReady = putDataValid && lineValid(putDataLine) &&
+    !linePutIssued(putDataLine) && putDataHasBytes
+
+  io.to_l2cache.valid := putDataReady && freeAckValid
+  io.to_l2cache.bits.a_opcode := Mux(putDataFullLine, 0.U, 1.U)
+  io.to_l2cache.bits.a_param := 0.U
+  val ackSource = if (ackSourcePadBits == 0) {
+    Cat(
+      freeAckIdx(tagIdxWidth - 1, 0),
+      lineInst(putDataLine)(instIdxWidth - 1, 0),
+      2.U(dmaSourceLowBits.W)
+    )
+  } else {
+    Cat(
+      0.U(ackSourcePadBits.W),
+      freeAckIdx(tagIdxWidth - 1, 0),
+      lineInst(putDataLine)(instIdxWidth - 1, 0),
+      2.U(dmaSourceLowBits.W)
+    )
+  }
+  io.to_l2cache.bits.a_source := ackSource
+  io.to_l2cache.bits.a_addr.foreach(_ := linePaddr(putDataLine))
+  io.to_l2cache.bits.a_data := putDataVec
+  io.to_l2cache.bits.a_mask := putDataMask
+  io.to_l2cache.bits.spike_info.foreach(_ := io.to_l2cache.bits.defaultSpikeInfo)
+
+  when(io.to_l2cache.fire) {
+    ackValid(freeAckIdx) := true.B
+    ackInst(freeAckIdx) := lineInst(putDataLine)
+    ackLine(freeAckIdx) := putDataLine
+    ackReleaseLine(freeAckIdx) := !lineEarlyRelease(putDataLine)
+    if (PMU_DMA_S2G_DETAIL) {
+      perfAckIssueCycle.foreach { cycles =>
+        cycles(freeAckIdx) := perfCycle.get
       }
     }
-    pendingReadMaskReg := pendingNext
-    when(pendingNext === 0.U) {
-      state := s_tlb_req
+    linePutIssued(putDataLine) := true.B
+    when(lineEarlyRelease(putDataLine)) {
+      lineValid(putDataLine) := false.B
+    }
+    putDataValid := false.B
+    when(!reset.asBool) {
+      assert(putDataHasBytes, "DMA S2G attempted to issue an empty L2 Put")
     }
   }
 
-  when(state === s_tlb_req && io.to_l2TLB.fire) {
-    state := s_tlb_rsp
-  }
+  // -----------------------------
+  // L2 AccessAck collect
+  // -----------------------------
+  io.from_l2cache.ready := true.B
+  val rspAckIdx = io.from_l2cache.bits.d_source(
+    ackSourceBase + tagIdxWidth - 1,
+    ackSourceBase
+  )
+  val rspAckInst = io.from_l2cache.bits.d_source(
+    ackSourceBase - 1,
+    dmaSourceLowBits
+  )
+  val ackInstIdx = ackInst(rspAckIdx)
+  val l2AckFire = io.from_l2cache.fire
 
-  when(state === s_tlb_rsp && io.from_l2TLB.fire) {
-    pAddrReg := io.from_l2TLB.bits.paddr
-    state := s_l2_req
-  }
-
-  when(state === s_l2_req && io.to_l2cache.fire) {
-    state := s_l2_rsp
-  }
-
-  when(state === s_l2_rsp && io.from_l2cache.fire) {
+  when(l2AckFire) {
     when(!reset.asBool) {
       assert(io.from_l2cache.bits.d_opcode === 0.U,
         "DMA S2G L2 response must be AccessAck")
+      assert(ackValid(rspAckIdx),
+        "DMA S2G L2 ack used an invalid ack entry")
+      assert(ackInst(rspAckIdx) === rspAckInst,
+        "DMA S2G L2 ack source inst index mismatch")
     }
-    when(offsetReg + chunkBytesReg >= sizeReg) {
-      state := s_complete
-    }.otherwise {
-      offsetReg := offsetReg + chunkBytesReg
-      state := s_shared_req
+    ackValid(rspAckIdx) := false.B
+    when(ackReleaseLine(rspAckIdx)) {
+      lineValid(ackLine(rspAckIdx)) := false.B
     }
   }
 
-  when(state === s_complete && io.inst_complete.fire) {
-    state := s_idle
+  // -----------------------------
+  // Pending-line accounting and completion
+  // -----------------------------
+  for (i <- 0 until max_dma_inst) {
+    val inc = lineAllocFire && lineAllocInstIdx === i.U
+    val dec = l2AckFire && ackInstIdx === i.U
+    val pendingNext = instPendingLines(i) + inc.asUInt - dec.asUInt
+    when(inc || dec) {
+      instPendingLines(i) := pendingNext
+    }
+    when(dec && instAddrDone(i) && pendingNext === 0.U) {
+      instComplete(i) := true.B
+    }
+    when(!reset.asBool) {
+      assert(!(dec && instPendingLines(i) === 0.U && !inc),
+        "DMA S2G pending line counter underflow")
+    }
+  }
+
+  val instCompleteInOrder = Wire(Vec(max_dma_inst, Bool()))
+  for (i <- 0 until max_dma_inst) {
+    val olderSameWarpValid = VecInit((0 until max_dma_inst).map { j =>
+      if (i == j) {
+        false.B
+      } else {
+        instValid(j) && instWid(j) === instWid(i) && instSeq(j) < instSeq(i)
+      }
+    }).asUInt.orR
+    instCompleteInOrder(i) := instComplete(i) && !olderSameWarpValid
+  }
+  io.inst_complete.valid := instCompleteInOrder.asUInt.orR
+  val completeIdx = PriorityEncoder(instCompleteInOrder)
+  io.inst_complete.bits.wid := instWid(completeIdx)
+  io.inst_complete.bits.group := instGroup(completeIdx)
+  io.inst_complete.bits.is_s2g := true.B
+  when(io.inst_complete.fire) {
+    instValid(completeIdx) := false.B
+    instExternal(completeIdx) := false.B
+    instComplete(completeIdx) := false.B
+    instAddrDone(completeIdx) := false.B
+    instPendingLines(completeIdx) := 0.U
+  }
+
+  if (PMU_DMA_S2G) {
+    val putBytes = PopCount(putDataMask.asUInt).pad(64)
+    if (PMU_DMA_S2G_DETAIL) {
+      val lineFullStall = (genInstValid || io.line_task.valid) && !freeLineValid
+      val readEntryFullStall = readIssueLineValid && !freeReadValid
+      val ackTagFullStall = putDataReady && !freeAckValid
+      val ackLatency = perfCycle.get - perfAckIssueCycle.get(rspAckIdx)
+      when(io.perfReset) {
+        perfCycle.get := 0.U
+        perfAckLatencySum.get := 0.U
+        perfLineFullStallCycles.get := 0.U
+        perfReadEntryFullStallCycles.get := 0.U
+        perfAckTagFullStallCycles.get := 0.U
+        for (i <- 0 until ackEntries) {
+          perfAckIssueCycle.get(i) := 0.U
+        }
+      }.elsewhen(io.perfEnable) {
+        perfCycle.get := perfCycle.get + 1.U
+        when(l2AckFire) {
+          perfAckLatencySum.get := perfAckLatencySum.get + ackLatency
+        }
+        when(lineFullStall) {
+          perfLineFullStallCycles.get := perfLineFullStallCycles.get + 1.U
+        }
+        when(readEntryFullStall) {
+          perfReadEntryFullStallCycles.get := perfReadEntryFullStallCycles.get + 1.U
+        }
+        when(ackTagFullStall) {
+          perfAckTagFullStallCycles.get := perfAckTagFullStallCycles.get + 1.U
+        }
+      }
+    }
+
+    when(io.perfReset) {
+      perfInstIssued.get := 0.U
+      perfLineIssued.get := 0.U
+      perfPutFull.get := 0.U
+      perfPutPart.get := 0.U
+      perfBytesWritten.get := 0.U
+      perfSharedReadReq.get := 0.U
+      perfSharedReadRsp.get := 0.U
+      perfTlbReq.get := 0.U
+      perfAckCount.get := 0.U
+    }.elsewhen(io.perfEnable) {
+      when(inputFire) {
+        perfInstIssued.get := perfInstIssued.get + 1.U
+      }
+      when(lineAllocFire) {
+        perfLineIssued.get := perfLineIssued.get + 1.U
+      }
+      when(readIssueFire) {
+        perfSharedReadReq.get := perfSharedReadReq.get + 1.U
+      }
+      when(io.shared_rsp.fire) {
+        perfSharedReadRsp.get := perfSharedReadRsp.get + 1.U
+      }
+      when(io.to_l2TLB.fire) {
+        perfTlbReq.get := perfTlbReq.get + 1.U
+      }
+      when(io.to_l2cache.fire) {
+        when(putDataFullLine) {
+          perfPutFull.get := perfPutFull.get + 1.U
+        }.otherwise {
+          perfPutPart.get := perfPutPart.get + 1.U
+        }
+        perfBytesWritten.get := perfBytesWritten.get + putBytes
+      }
+      when(l2AckFire) {
+        perfAckCount.get := perfAckCount.get + 1.U
+      }
+    }
+
+    io.perf.get.instIssued := perfInstIssued.get
+    io.perf.get.lineIssued := perfLineIssued.get
+    io.perf.get.putFull := perfPutFull.get
+    io.perf.get.putPart := perfPutPart.get
+    io.perf.get.bytesWritten := perfBytesWritten.get
+    io.perf.get.sharedReadReq := perfSharedReadReq.get
+    io.perf.get.sharedReadRsp := perfSharedReadRsp.get
+    io.perf.get.tlbReq := perfTlbReq.get
+    io.perf.get.ackCount := perfAckCount.get
+    if (PMU_DMA_S2G_DETAIL) {
+      io.perf.get.ackLatencySum := perfAckLatencySum.get
+      io.perf.get.lineFullStallCycles := perfLineFullStallCycles.get
+      io.perf.get.readEntryFullStallCycles := perfReadEntryFullStallCycles.get
+      io.perf.get.ackTagFullStallCycles := perfAckTagFullStallCycles.get
+    } else {
+      io.perf.get.ackLatencySum := 0.U
+      io.perf.get.lineFullStallCycles := 0.U
+      io.perf.get.readEntryFullStallCycles := 0.U
+      io.perf.get.ackTagFullStallCycles := 0.U
+    }
+  }
+
+  when(!reset.asBool) {
+    assert(!(lineAllocFire && !freeLineValid),
+      "DMA S2G line allocation fired with no free line entry")
+    assert(!(readIssueFire && !freeReadValid),
+      "DMA S2G shared read allocation fired with no free read entry")
+    assert(!(io.to_l2cache.fire && !freeAckValid),
+      "DMA S2G L2 Put allocation fired with no free ack entry")
   }
 }

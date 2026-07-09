@@ -300,10 +300,19 @@ class collectorUnit extends Module{
         )
         ready(1) := 1.U
       }.elsewhen(io.bankIn(i).bits.regOrder === 2.U) { //operand3
+        val scalarStoreData = Mux(
+          MuxLookup(state, false.B)(
+            Array(
+              s_idle -> regIdxWire(2).orR,
+              s_add -> regIdx(2).orR
+            )),
+          VecInit.fill(num_thread)(io.bankIn(i).bits.data(0)),
+          VecInit.fill(num_thread)(0.U(xLen.W))
+        )
         rsReg(2) := MuxLookup(controlReg.sel_alu3, VecInit.fill(num_thread)(0.U(xLen.W)))(
           Array(A3_PC -> VecInit.fill(num_thread)(imm.io.out + io.bankIn(i).bits.data(0)),
             A3_VRS3 -> io.bankIn(i).bits.data,
-            A3_SD -> Mux(controlReg.isvec, io.bankIn(i).bits.data, VecInit.fill(num_thread)(io.bankIn(i).bits.data(0))),
+            A3_SD -> Mux(controlReg.isvec, io.bankIn(i).bits.data, scalarStoreData),
             A3_FRS3 -> VecInit.fill(num_thread)(io.bankIn(i).bits.data(0))
           )
         )

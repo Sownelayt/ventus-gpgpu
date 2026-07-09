@@ -58,6 +58,7 @@ class pipe() extends Module{
     val perfReset = Input(Bool())
     val perf_pipeline = if(PMU_PIPELINE) Some(Output(new PipelinePerfCounters)) else None
     val perf_inst_class = if(PMU_INST_CLASS) Some(Output(new InstClassPerfCounters)) else None
+    val perf_s2g = if(PMU_DMA_S2G) Some(Output(new S2GPerfCounters)) else None
     // DMA ports
     val dma_cache_req = DecoupledIO(new DCacheMemReq_p)
     val dma_cache_rsp = Flipped(DecoupledIO(new DCacheMemRsp))
@@ -66,7 +67,7 @@ class pipe() extends Module{
     // DMA TLB ports
     val dma_tlb_req = DecoupledIO(new L1TlbReq(SV32))
     val dma_tlb_rsp = Flipped(DecoupledIO(new L1TlbRsp(SV32)))
-    val fence_end_dma = DecoupledIO(UInt(depth_warp.W))
+    val fence_end_dma = DecoupledIO(new DmaCompletion)
   })
   val issue_stall=Wire(Bool())
   val flush=Wire(Bool())
@@ -100,6 +101,9 @@ class pipe() extends Module{
   val mul=Module(new vMULv2(num_thread,num_lane))
   val tensorcore=Module(new vTCexe)
   val dma_core=Module(new DMA_core)
+  dma_core.io.perfEnable := io.perfEnable
+  dma_core.io.perfReset := io.perfReset
+  io.perf_s2g.foreach(_ := dma_core.io.perf_s2g.getOrElse(0.U.asTypeOf(new S2GPerfCounters)))
   val lsu2wb=Module(new LSU2WB)
   val wb=Module(new Writeback(6,7))
 
@@ -424,8 +428,11 @@ class pipe() extends Module{
   // DMA connections
   val dma_issue_wid = issueX.io.out_DMA.bits.ctrl.wid
   val dma_issue_allow = warp_sche.io.dma_issue_allow(dma_issue_wid)
+  val dma_req_bits = Wire(new vExeData)
+  dma_req_bits := issueX.io.out_DMA.bits
+  dma_req_bits.ctrl.dma_group := warp_sche.io.dma_issue_group(dma_issue_wid)
   dma_core.io.dma_req.valid := issueX.io.out_DMA.valid && dma_issue_allow
-  dma_core.io.dma_req.bits := issueX.io.out_DMA.bits
+  dma_core.io.dma_req.bits := dma_req_bits
   issueX.io.out_DMA.ready := dma_core.io.dma_req.ready && dma_issue_allow
   issueV.io.out_DMA.ready := false.B
   warp_sche.io.dma_issue.valid := dma_core.io.dma_req.fire
@@ -488,6 +495,7 @@ class pipe() extends Module{
   val frontendStallCycles = RegInit(0.U(64.W))
   val lsuBackpressureCycles = RegInit(0.U(64.W))
   val ibufferFullCycles = RegInit(0.U(64.W))
+  val dmaFenceWaitStallCycles = RegInit(0.U(64.W))
 
   val computeIssued = RegInit(0.U(64.W))
   val memIssued = RegInit(0.U(64.W))
@@ -501,12 +509,17 @@ class pipe() extends Module{
   val anySchedulableInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && warp_sche.io.warp_ready(i))).asUInt.orR
   val anyScoreExeBlockedInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && (scoreboardBusy(i) || warp_sche.io.exe_busy(i)))).asUInt.orR
   val anyBarrierBlockedInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && warp_sche.io.barrier_busy(i))).asUInt.orR
+  val anyDmaFenceWaitBlockedInst = VecInit((0 until num_warp).map(i =>
+    ibuffer.io.out(i).valid && warp_sche.io.dma_fence_wait_dbg(i)
+  )).asUInt.orR
   val noIssueFire = !issueX.io.in.fire && !issueV.io.in.fire
   val noIssueInput = !issueX.io.in.valid && !issueV.io.in.valid
   val dataDepStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst && anyScoreExeBlockedInst
   val barrierStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst &&
     !anyScoreExeBlockedInst && anyBarrierBlockedInst
-  val frontendStall = noIssueFire && noIssueInput && !dataDepStall && !barrierStall
+  val dmaFenceWaitStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst &&
+    !anyScoreExeBlockedInst && !anyBarrierBlockedInst && anyDmaFenceWaitBlockedInst
+  val frontendStall = noIssueFire && noIssueInput && !dataDepStall && !barrierStall && !dmaFenceWaitStall
 
   val flushEvent = warp_sche.io.flush.valid && !RegNext(warp_sche.io.flush.valid, false.B)
 
@@ -522,6 +535,7 @@ class pipe() extends Module{
     frontendStallCycles := 0.U
     lsuBackpressureCycles := 0.U
     ibufferFullCycles := 0.U
+    dmaFenceWaitStallCycles := 0.U
     computeIssued := 0.U
     memIssued := 0.U
     ctrlIssued := 0.U
@@ -565,6 +579,9 @@ class pipe() extends Module{
     when(frontendStall){
       frontendStallCycles := frontendStallCycles + 1.U
     }
+    when(dmaFenceWaitStall){
+      dmaFenceWaitStallCycles := dmaFenceWaitStallCycles + 1.U
+    }
     when(flushEvent){
       controlHazardFlushCount := controlHazardFlushCount + 1.U
     }
@@ -588,6 +605,7 @@ class pipe() extends Module{
     perf.frontendStallCycles := frontendStallCycles
     perf.lsuBackpressureCycles := lsuBackpressureCycles
     perf.ibufferFullCycles := ibufferFullCycles
+    perf.dmaFenceWaitStallCycles := dmaFenceWaitStallCycles
   }
 
   io.perf_inst_class.foreach { perf =>

@@ -11,7 +11,7 @@
 package pipeline
 
 import chisel3._
-import chisel3.util.{Decoupled, DecoupledIO, MuxLookup, Queue, UIntToOH}
+import chisel3.util.{Decoupled, DecoupledIO, MuxLookup, Queue, UIntToOH, log2Ceil}
 import top.parameters._
 import IDecode._
 
@@ -64,8 +64,15 @@ class CtrlSigs extends Bundle {
   val dma = Bool()
   val funct = UInt(3.W)
   val copysize = UInt(2.W)
+  val dma_group = UInt(log2Ceil(dma_group_entries).W)
   //override def cloneType: CtrlSigs.this.type = new CtrlSigs().asInstanceOf[this.type]
   val asid = if(MMU_ENABLED) Some(UInt(KNL_ASID_WIDTH.W)) else None
+}
+
+class DmaCompletion extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val group = UInt(log2Ceil(dma_group_entries).W)
+  val is_s2g = Bool()
 }
 class scoreboardIO extends Bundle{
   val ibuffer_if_ctrl=Input(new CtrlSigs())

@@ -15,6 +15,8 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
   val INST_CNT_2: Boolean = false
   val PMU_PIPELINE: Boolean = true
   val PMU_INST_CLASS: Boolean = true
+  val PMU_DMA_S2G: Boolean = true
+  val PMU_DMA_S2G_DETAIL: Boolean = true
   val GVM_ENABLED: Boolean = sys.env.getOrElse("RTL_GVM_ENABLED", "false").toBoolean
   val MMU_ENABLED: Boolean = false
   val DCACHE_DEBUG: Boolean = false
@@ -150,6 +152,13 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
   def max_dma_inst = if(num_warp >= 4) num_warp else 4  // max DMA instructions in flight
   def max_dma_tag = 8
   def max_l2cacheline = 6
+  def s2g_line_entries = 4
+  def s2g_shared_read_entries = {
+    val maxByLine = s2g_line_entries * 2
+    if (lsu_nMshrEntry < maxByLine) lsu_nMshrEntry else maxByLine
+  }
+  def s2g_completion_entries = 4
+  def dma_group_entries = 4
   def tma_desc_cache_entries = 2
   def tma_prefetch_slots = 2
   def dma_data_width = num_thread * xLen  // DMA data width matches L2 cacheline

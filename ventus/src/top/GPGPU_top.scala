@@ -369,6 +369,27 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   def sumInstClassPerfCounter(select: InstClassPerfCounters => UInt): UInt = {
     if (PMU_INST_CLASS) sm_wrapper.map(sm => select(sm.inst_class_perf.get)).reduce(_ + _) else 0.U(64.W)
   }
+  def sumS2GPerfCounter(select: S2GPerfCounters => UInt): UInt = {
+    if (PMU_DMA_S2G) sm_wrapper.map(sm => select(sm.s2g_perf.get)).reduce(_ + _) else 0.U(64.W)
+  }
+  def zeroS2GPerf: S2GPerfCounters = 0.U.asTypeOf(new S2GPerfCounters)
+  def addS2GPerf(a: S2GPerfCounters, b: S2GPerfCounters): S2GPerfCounters = {
+    val sum = Wire(new S2GPerfCounters)
+    sum.instIssued := a.instIssued + b.instIssued
+    sum.lineIssued := a.lineIssued + b.lineIssued
+    sum.putFull := a.putFull + b.putFull
+    sum.putPart := a.putPart + b.putPart
+    sum.bytesWritten := a.bytesWritten + b.bytesWritten
+    sum.sharedReadReq := a.sharedReadReq + b.sharedReadReq
+    sum.sharedReadRsp := a.sharedReadRsp + b.sharedReadRsp
+    sum.tlbReq := a.tlbReq + b.tlbReq
+    sum.ackCount := a.ackCount + b.ackCount
+    sum.ackLatencySum := a.ackLatencySum + b.ackLatencySum
+    sum.lineFullStallCycles := a.lineFullStallCycles + b.lineFullStallCycles
+    sum.readEntryFullStallCycles := a.readEntryFullStallCycles + b.readEntryFullStallCycles
+    sum.ackTagFullStallCycles := a.ackTagFullStallCycles + b.ackTagFullStallCycles
+    sum
+  }
   def percentOf(numer: UInt, denom: UInt): UInt = {
     Mux(denom === 0.U, 0.U(32.W), ((numer * 100.U) / denom)(31, 0))
   }
@@ -405,11 +426,26 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   val pmuFrontendStall = sumPipelinePerfCounter(_.frontendStallCycles)
   val pmuLsuBackpressure = sumPipelinePerfCounter(_.lsuBackpressureCycles)
   val pmuIbufferFullCycles = sumPipelinePerfCounter(_.ibufferFullCycles)
+  val pmuDmaFenceWaitStall = sumPipelinePerfCounter(_.dmaFenceWaitStallCycles)
 
   val pmuComputeIssued = sumInstClassPerfCounter(_.computeIssued)
   val pmuMemIssued = sumInstClassPerfCounter(_.memIssued)
   val pmuCtrlIssued = sumInstClassPerfCounter(_.ctrlIssued)
   val pmuTotalIssued = pmuTotalScalarIssued + pmuTotalVectorIssued
+  val pmuS2G = Wire(new S2GPerfCounters)
+  pmuS2G.instIssued := sumS2GPerfCounter(_.instIssued)
+  pmuS2G.lineIssued := sumS2GPerfCounter(_.lineIssued)
+  pmuS2G.putFull := sumS2GPerfCounter(_.putFull)
+  pmuS2G.putPart := sumS2GPerfCounter(_.putPart)
+  pmuS2G.bytesWritten := sumS2GPerfCounter(_.bytesWritten)
+  pmuS2G.sharedReadReq := sumS2GPerfCounter(_.sharedReadReq)
+  pmuS2G.sharedReadRsp := sumS2GPerfCounter(_.sharedReadRsp)
+  pmuS2G.tlbReq := sumS2GPerfCounter(_.tlbReq)
+  pmuS2G.ackCount := sumS2GPerfCounter(_.ackCount)
+  pmuS2G.ackLatencySum := sumS2GPerfCounter(_.ackLatencySum)
+  pmuS2G.lineFullStallCycles := sumS2GPerfCounter(_.lineFullStallCycles)
+  pmuS2G.readEntryFullStallCycles := sumS2GPerfCounter(_.readEntryFullStallCycles)
+  pmuS2G.ackTagFullStallCycles := sumS2GPerfCounter(_.ackTagFullStallCycles)
 
   val perfWindowStarted = RegInit(false.B)
   val perfWindowPrinted = RegInit(false.B)
@@ -426,9 +462,11 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   val totalFrontendStall = RegInit(0.U(64.W))
   val totalLsuBackpressure = RegInit(0.U(64.W))
   val totalIbufferFullCycles = RegInit(0.U(64.W))
+  val totalDmaFenceWaitStall = RegInit(0.U(64.W))
   val totalComputeIssued = RegInit(0.U(64.W))
   val totalMemIssued = RegInit(0.U(64.W))
   val totalCtrlIssued = RegInit(0.U(64.W))
+  val totalS2G = RegInit(0.U.asTypeOf(new S2GPerfCounters))
   val totalL1dReq = RegInit(0.U(64.W))
   val totalL1dHit = RegInit(0.U(64.W))
   val totalL1dReadPrimaryMiss = RegInit(0.U(64.W))
@@ -465,9 +503,11 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
     totalFrontendStall := totalFrontendStall + pmuFrontendStall
     totalLsuBackpressure := totalLsuBackpressure + pmuLsuBackpressure
     totalIbufferFullCycles := totalIbufferFullCycles + pmuIbufferFullCycles
+    totalDmaFenceWaitStall := totalDmaFenceWaitStall + pmuDmaFenceWaitStall
     totalComputeIssued := totalComputeIssued + pmuComputeIssued
     totalMemIssued := totalMemIssued + pmuMemIssued
     totalCtrlIssued := totalCtrlIssued + pmuCtrlIssued
+    totalS2G := addS2GPerf(totalS2G, pmuS2G)
     totalL1dReq := totalL1dReq + l1dTotalReq
     totalL1dHit := totalL1dHit + l1dTotalHit
     totalL1dReadPrimaryMiss := totalL1dReadPrimaryMiss + l1dReadPrimaryMiss
@@ -505,9 +545,11 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
   val summaryFrontendStall = includeCurrentWindow(totalFrontendStall, pmuFrontendStall)
   val summaryLsuBackpressure = includeCurrentWindow(totalLsuBackpressure, pmuLsuBackpressure)
   val summaryIbufferFullCycles = includeCurrentWindow(totalIbufferFullCycles, pmuIbufferFullCycles)
+  val summaryDmaFenceWaitStall = includeCurrentWindow(totalDmaFenceWaitStall, pmuDmaFenceWaitStall)
   val summaryComputeIssued = includeCurrentWindow(totalComputeIssued, pmuComputeIssued)
   val summaryMemIssued = includeCurrentWindow(totalMemIssued, pmuMemIssued)
   val summaryCtrlIssued = includeCurrentWindow(totalCtrlIssued, pmuCtrlIssued)
+  val summaryS2G = addS2GPerf(totalS2G, Mux(perfDumpPulse, pmuS2G, zeroS2GPerf))
   val summaryL1dReq = includeCurrentWindow(totalL1dReq, l1dTotalReq)
   val summaryL1dHit = includeCurrentWindow(totalL1dHit, l1dTotalHit)
   val summaryL1dReadPrimaryMiss = includeCurrentWindow(totalL1dReadPrimaryMiss, l1dReadPrimaryMiss)
@@ -542,6 +584,7 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
       printf(p"[PROGRAM ${programId}] [STALL] frontend stall cycles  : ${pmuFrontendStall}\n")
       printf(p"[PROGRAM ${programId}] [STALL] lsu backpressure cyc   : ${pmuLsuBackpressure}\n")
       printf(p"[PROGRAM ${programId}] [STALL] ibuffer full cycles    : ${pmuIbufferFullCycles}\n")
+      printf(p"[PROGRAM ${programId}] [STALL] dma fence/group wait  : ${pmuDmaFenceWaitStall}\n")
     }
     if (PMU_INST_CLASS) {
       printf(p"[PROGRAM ${programId}] [INST CLASS] compute issued    : ${pmuComputeIssued}\n")
@@ -564,6 +607,21 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
     printf(p"[PROGRAM ${programId}] [L1D PERF] bank conflict cyc   : ${l1dBankConflictCycles}\n")
     printf(p"[PROGRAM ${programId}] [L1D PERF] coreReqPipe pipelined cyc : ${l1dCoreReqPipePipelined}\n")
     printf(p"[PROGRAM ${programId}] [L1D PERF] memRspPipe decoupled cyc  : ${l1dMemRspPipeDecoupled}\n")
+    if (PMU_DMA_S2G) {
+      printf(p"[PROGRAM ${programId}] [S2G PERF] inst issued        : ${pmuS2G.instIssued}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] line issued        : ${pmuS2G.lineIssued}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] PutFull/PutPart    : ${pmuS2G.putFull}/${pmuS2G.putPart}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] bytes written      : ${pmuS2G.bytesWritten}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] shared req/rsp      : ${pmuS2G.sharedReadReq}/${pmuS2G.sharedReadRsp}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] tlb req            : ${pmuS2G.tlbReq}\n")
+      printf(p"[PROGRAM ${programId}] [S2G PERF] ack count         : ${pmuS2G.ackCount}\n")
+      if (PMU_DMA_S2G_DETAIL) {
+        printf(p"[PROGRAM ${programId}] [S2G PERF] ack latency sum   : ${pmuS2G.ackLatencySum}\n")
+        printf(p"[PROGRAM ${programId}] [S2G PERF] line full stall   : ${pmuS2G.lineFullStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [S2G PERF] read full stall   : ${pmuS2G.readEntryFullStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [S2G PERF] ack full stall    : ${pmuS2G.ackTagFullStallCycles}\n")
+      }
+    }
   }
   when((perfDumpPulse || io.perfDumpSummary) && summaryProgramWindows =/= 0.U){
     printf(p"\n[TESTCASE TOTAL] [PMU] accumulated summary across ${summaryProgramWindows} program windows\n")
@@ -581,6 +639,7 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
       printf(p"[TESTCASE TOTAL] [STALL] frontend stall cycles  : ${summaryFrontendStall}\n")
       printf(p"[TESTCASE TOTAL] [STALL] lsu backpressure cyc   : ${summaryLsuBackpressure}\n")
       printf(p"[TESTCASE TOTAL] [STALL] ibuffer full cycles    : ${summaryIbufferFullCycles}\n")
+      printf(p"[TESTCASE TOTAL] [STALL] dma fence/group wait  : ${summaryDmaFenceWaitStall}\n")
     }
     if (PMU_INST_CLASS) {
       printf(p"[TESTCASE TOTAL] [INST CLASS] compute issued    : ${summaryComputeIssued}\n")
@@ -603,6 +662,21 @@ class GPGPU_top(implicit p: Parameters, FakeCache: Boolean = false, SV: Option[m
     printf(p"[TESTCASE TOTAL] [L1D PERF] bank conflict cyc   : ${summaryL1dBankConflictCycles}\n")
     printf(p"[TESTCASE TOTAL] [L1D PERF] coreReqPipe pipelined cyc : ${summaryL1dCoreReqPipePipelined}\n")
     printf(p"[TESTCASE TOTAL] [L1D PERF] memRspPipe decoupled cyc  : ${summaryL1dMemRspPipeDecoupled}\n")
+    if (PMU_DMA_S2G) {
+      printf(p"[TESTCASE TOTAL] [S2G PERF] inst issued        : ${summaryS2G.instIssued}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] line issued        : ${summaryS2G.lineIssued}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] PutFull/PutPart    : ${summaryS2G.putFull}/${summaryS2G.putPart}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] bytes written      : ${summaryS2G.bytesWritten}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] shared req/rsp      : ${summaryS2G.sharedReadReq}/${summaryS2G.sharedReadRsp}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] tlb req            : ${summaryS2G.tlbReq}\n")
+      printf(p"[TESTCASE TOTAL] [S2G PERF] ack count         : ${summaryS2G.ackCount}\n")
+      if (PMU_DMA_S2G_DETAIL) {
+        printf(p"[TESTCASE TOTAL] [S2G PERF] ack latency sum   : ${summaryS2G.ackLatencySum}\n")
+        printf(p"[TESTCASE TOTAL] [S2G PERF] line full stall   : ${summaryS2G.lineFullStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [S2G PERF] read full stall   : ${summaryS2G.readEntryFullStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [S2G PERF] ack full stall    : ${summaryS2G.ackTagFullStallCycles}\n")
+      }
+    }
   }
 
   for(i <- 0 until NL2Cache){
@@ -634,6 +708,7 @@ class SM_wrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = None) ext
     val dcache_perf = Output(new DCachePerfCounters)
     val pipeline_perf = if(PMU_PIPELINE) Some(Output(new PipelinePerfCounters)) else None
     val inst_class_perf = if(PMU_INST_CLASS) Some(Output(new InstClassPerfCounters)) else None
+    val s2g_perf = if(PMU_DMA_S2G) Some(Output(new S2GPerfCounters)) else None
     val inst = if (SINGLE_INST) Some(Flipped(DecoupledIO(UInt(32.W)))) else None
     val inst_cnt = if(INST_CNT) Some(Output(UInt(32.W))) else if(INST_CNT_2) Some(Output(Vec(2, UInt(32.W)))) else None
     val l2tlbReq = if(MMU_ENABLED) Some(Vec(num_cache_in_sm, DecoupledIO(new Bundle{
@@ -660,6 +735,7 @@ class SM_wrapper(FakeCache: Boolean = false, SV: Option[mmu.SVParam] = None) ext
   io.inst_cnt2.foreach( _ := pipe.io.inst_cnt2.getOrElse(0.U))
   io.pipeline_perf.foreach(_ := pipe.io.perf_pipeline.getOrElse(0.U.asTypeOf(new PipelinePerfCounters)))
   io.inst_class_perf.foreach(_ := pipe.io.perf_inst_class.getOrElse(0.U.asTypeOf(new InstClassPerfCounters)))
+  io.s2g_perf.foreach(_ := pipe.io.perf_s2g.getOrElse(0.U.asTypeOf(new S2GPerfCounters)))
   val cnt=Counter(10)
   when(cnt.value<5.U){cnt.inc()}
   when(cnt.value===5.U){pipe.io.pc_reset:=false.B}
