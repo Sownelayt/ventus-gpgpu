@@ -6,6 +6,12 @@ import mmu.SV32.{asidLen, paLen, vaLen}
 // TODO: MOVE parameters to `ventus/top'
 
 object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, not the last idx.
+  private def envFlag(name: String, default: Boolean): Boolean =
+    sys.env.get(name).map(_.trim.toLowerCase).collect {
+      case "1" | "true" | "yes" | "on" => true
+      case "0" | "false" | "no" | "off" => false
+    }.getOrElse(default)
+
   def num_sm = 2
   var num_warp = 8
   var num_thread = 32
@@ -15,8 +21,11 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
   val INST_CNT_2: Boolean = false
   val PMU_PIPELINE: Boolean = true
   val PMU_INST_CLASS: Boolean = true
-  val PMU_DMA_S2G: Boolean = true
-  val PMU_DMA_S2G_DETAIL: Boolean = true
+  // Normal simulation keeps DMA PMU visibility. Final/DC elaboration can
+  // remove the counters and their aggregation logic with environment flags.
+  val PMU_DMA_S2G: Boolean = envFlag("VENTUS_PMU_DMA_S2G", default = true)
+  val PMU_DMA_S2G_DETAIL: Boolean = PMU_DMA_S2G &&
+    envFlag("VENTUS_PMU_DMA_S2G_DETAIL", default = true)
   val GVM_ENABLED: Boolean = sys.env.getOrElse("RTL_GVM_ENABLED", "false").toBoolean
   val MMU_ENABLED: Boolean = false
   val DCACHE_DEBUG: Boolean = false
