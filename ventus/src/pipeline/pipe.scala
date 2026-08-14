@@ -58,7 +58,7 @@ class pipe() extends Module{
     val perfReset = Input(Bool())
     val perf_pipeline = if(PMU_PIPELINE) Some(Output(new PipelinePerfCounters)) else None
     val perf_inst_class = if(PMU_INST_CLASS) Some(Output(new InstClassPerfCounters)) else None
-    val perf_s2g = if(PMU_DMA_S2G) Some(Output(new S2GPerfCounters)) else None
+    val perf_tma = if(PMU_TMA) Some(Output(new TmaPerfCounters)) else None
     // DMA ports
     val dma_cache_req = DecoupledIO(new DCacheMemReq_p)
     val dma_cache_rsp = Flipped(DecoupledIO(new DCacheMemRsp))
@@ -67,7 +67,7 @@ class pipe() extends Module{
     // DMA TLB ports
     val dma_tlb_req = DecoupledIO(new L1TlbReq(SV32))
     val dma_tlb_rsp = Flipped(DecoupledIO(new L1TlbRsp(SV32)))
-    val fence_end_dma = DecoupledIO(new DmaCompletion)
+    val tma_completion = DecoupledIO(new DmaCompletion)
   })
   val issue_stall=Wire(Bool())
   val flush=Wire(Bool())
@@ -100,10 +100,12 @@ class pipe() extends Module{
   val sfu=Module(new SFUexe)
   val mul=Module(new vMULv2(num_thread,num_lane))
   val tensorcore=Module(new vTCexe)
-  val dma_core=Module(new DMA_core)
+  val dma_core=Module(new TmaV2DmaCore)
+  val tmaGroupTracker = Module(new TmaV2S2GGroupTracker)
+  val tmaMbarrier = Module(new TmaV2MbarrierController)
   dma_core.io.perfEnable := io.perfEnable
   dma_core.io.perfReset := io.perfReset
-  io.perf_s2g.foreach(_ := dma_core.io.perf_s2g.getOrElse(0.U.asTypeOf(new S2GPerfCounters)))
+  io.perf_tma.foreach(_ := dma_core.io.perf_tma.getOrElse(0.U.asTypeOf(new TmaPerfCounters)))
   val lsu2wb=Module(new LSU2WB)
   val wb=Module(new Writeback(6,7))
 
@@ -187,6 +189,13 @@ class pipe() extends Module{
   warp_sche.io.scoreboard_busy:=scoreboardBusy
 
   csrfile.io.CTA2csr:=warp_sche.io.CTA2csr
+  val dmaStatusUpdate = Wire(Valid(new DmaStatusUpdate))
+  dmaStatusUpdate.valid := false.B
+  dmaStatusUpdate.bits := 0.U.asTypeOf(new DmaStatusUpdate)
+  when(tmaGroupTracker.io.status.valid) {
+    dmaStatusUpdate := tmaGroupTracker.io.status
+  }
+  csrfile.io.dmaStatusUpdate := dmaStatusUpdate
   val init_thread_mask = (1.U(num_thread.W) << warp_sche.io.CTA2csr.bits.CTAdata.dispatch2cu_wf_size_dispatch).asUInt - 1.U
   simt_stack.io.initMask.valid := warp_sche.io.CTA2csr.valid
   simt_stack.io.initMask.bits.warp_id := warp_sche.io.CTA2csr.bits.wid
@@ -199,6 +208,19 @@ class pipe() extends Module{
   warp_sche.io.warpReq<>io.warpReq
   warp_sche.io.warpRsp<>io.warpRsp
   warp_sche.io.flushDCache <> lsu.io.flush_dcache
+  warp_sche.io.lsu_fence_end := lsu.io.fence_end
+  tmaGroupTracker.io.control <> warp_sche.io.dma_group_cmd
+  warp_sche.io.dma_group_wait := tmaGroupTracker.io.waitMask
+  warp_sche.io.dma_group_inflight := tmaGroupTracker.io.inflight
+  tmaGroupTracker.io.clearAll := io.pc_reset
+  tmaGroupTracker.io.warpReset.valid := warp_sche.io.CTA2csr.valid
+  tmaGroupTracker.io.warpReset.bits := warp_sche.io.CTA2csr.bits.wid
+  tmaMbarrier.io.syncCommand <> warp_sche.io.dma_sync_cmd
+  warp_sche.io.dma_sync_wait := tmaMbarrier.io.waitMask
+  warp_sche.io.dma_mbarrier_owner_busy := tmaMbarrier.io.ownerBusy
+  tmaMbarrier.io.wgRelease := warp_sche.io.dma_mbarrier_release
+  tmaMbarrier.io.warpReset.valid := warp_sche.io.CTA2csr.valid
+  tmaMbarrier.io.warpReset.bits := warp_sche.io.CTA2csr.bits.wid
 
   //flush:=(warp_sche.io.branch.fire&warp_sche.io.branch.bits.jump) | ()
   flush:=warp_sche.io.flush.valid
@@ -427,31 +449,51 @@ class pipe() extends Module{
   issueX.io.out_TC.ready := false.B
   // DMA connections
   val dma_issue_wid = issueX.io.out_DMA.bits.ctrl.wid
-  val dma_issue_allow = warp_sche.io.dma_issue_allow(dma_issue_wid)
+  val dma_issue_is_s2g = issueX.io.out_DMA.bits.ctrl.funct === TmaV2Spec.FunctBulkS2G.U ||
+    issueX.io.out_DMA.bits.ctrl.funct === TmaV2Spec.FunctTensorS2G.U
+  val dma_issue_allow = !dma_issue_is_s2g || tmaGroupTracker.io.issueAllow(dma_issue_wid)
   val dma_req_bits = Wire(new vExeData)
   dma_req_bits := issueX.io.out_DMA.bits
-  dma_req_bits.ctrl.dma_group := warp_sche.io.dma_issue_group(dma_issue_wid)
+  dma_req_bits.ctrl.dma_group := tmaGroupTracker.io.issueGroup(dma_issue_wid)
   dma_core.io.dma_req.valid := issueX.io.out_DMA.valid && dma_issue_allow
   dma_core.io.dma_req.bits := dma_req_bits
-  issueX.io.out_DMA.ready := dma_core.io.dma_req.ready && dma_issue_allow
+  issueX.io.out_DMA.ready := dma_issue_allow && dma_core.io.dma_req.ready
   issueV.io.out_DMA.ready := false.B
-  warp_sche.io.dma_issue.valid := dma_core.io.dma_req.fire
-  warp_sche.io.dma_issue.bits := dma_issue_wid
+  tmaGroupTracker.io.issue.valid := dma_core.io.dma_req.fire
+  tmaGroupTracker.io.issue.bits.wid := dma_issue_wid
+  tmaGroupTracker.io.issue.bits.isS2G := dma_issue_is_s2g
   io.dma_cache_req <> dma_core.io.dma_cache_req
   dma_core.io.dma_cache_rsp <> io.dma_cache_rsp
-  io.dma_shared_req <> dma_core.io.shared_req
-  dma_core.io.shared_rsp <> io.dma_shared_rsp
+  val sharedArb = Module(new Arbiter(new ShareMemCoreReq_np, 2))
+  sharedArb.io.in(0) <> dma_core.io.shared_req
+  sharedArb.io.in(1) <> tmaMbarrier.io.sharedRequest
+  io.dma_shared_req <> sharedArb.io.out
+  val responseIsMbarrier = io.dma_shared_rsp.bits.isMBarrier
+  dma_core.io.shared_rsp.valid := io.dma_shared_rsp.valid && !responseIsMbarrier
+  dma_core.io.shared_rsp.bits := io.dma_shared_rsp.bits
+  tmaMbarrier.io.sharedResponse.valid := io.dma_shared_rsp.valid && responseIsMbarrier
+  tmaMbarrier.io.sharedResponse.bits := io.dma_shared_rsp.bits
+  io.dma_shared_rsp.ready := Mux(responseIsMbarrier,
+    tmaMbarrier.io.sharedResponse.ready, dma_core.io.shared_rsp.ready)
   io.dma_tlb_req <> dma_core.io.to_l2TLB
   dma_core.io.from_l2TLB <> io.dma_tlb_rsp
-  io.fence_end_dma.valid := dma_core.io.fence_end_dma.valid
-  io.fence_end_dma.bits := dma_core.io.fence_end_dma.bits
-  // DESIGN INVARIANT: fence_end_dma.ready must be unconditionally true.
-  // Temp_mem s_reset state requires single-beat fire to exit.
-  // Scheduler dma_complete consumes via .fire (ready && valid).
-  // Changing ready to conditional WILL deadlock the DMA completion path.
-  dma_core.io.fence_end_dma.ready := true.B
-  warp_sche.io.dma_complete.valid := dma_core.io.fence_end_dma.fire
-  warp_sche.io.dma_complete.bits := dma_core.io.fence_end_dma.bits
+  io.tma_completion.valid := dma_core.io.tma_completion.valid
+  io.tma_completion.bits := dma_core.io.tma_completion.bits
+  // The scheduler consumes completion on fire, so the integrated TMA sink is
+  // permanently ready and completion backpressure stays inside the engine.
+  dma_core.io.tma_completion.ready := true.B
+  tmaGroupTracker.io.completion.valid := dma_core.io.tma_completion.fire
+  tmaGroupTracker.io.completion.bits := dma_core.io.tma_completion.bits
+  tmaMbarrier.io.reserveRequest <> dma_core.io.txReserve
+  dma_core.io.txReserveResponse <> tmaMbarrier.io.reserveResponse
+  tmaMbarrier.io.completion.valid := dma_core.io.tma_completion.fire
+  tmaMbarrier.io.completion.bits := dma_core.io.tma_completion.bits
+  when(tmaMbarrier.io.status.valid) {
+    dmaStatusUpdate := tmaMbarrier.io.status
+  }
+  when(dma_core.io.status.valid) {
+    dmaStatusUpdate := dma_core.io.status
+  }
   issueV.io.out_vFPU<>fpu.io.in
   issueX.io.out_vFPU.ready := false.B
   issueX.io.out_warpscheduler <> warp_sche.io.warp_control
@@ -495,7 +537,7 @@ class pipe() extends Module{
   val frontendStallCycles = RegInit(0.U(64.W))
   val lsuBackpressureCycles = RegInit(0.U(64.W))
   val ibufferFullCycles = RegInit(0.U(64.W))
-  val dmaFenceWaitStallCycles = RegInit(0.U(64.W))
+  val tmaWaitStallCycles = RegInit(0.U(64.W))
 
   val computeIssued = RegInit(0.U(64.W))
   val memIssued = RegInit(0.U(64.W))
@@ -509,17 +551,17 @@ class pipe() extends Module{
   val anySchedulableInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && warp_sche.io.warp_ready(i))).asUInt.orR
   val anyScoreExeBlockedInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && (scoreboardBusy(i) || warp_sche.io.exe_busy(i)))).asUInt.orR
   val anyBarrierBlockedInst = VecInit((0 until num_warp).map(i => ibuffer.io.out(i).valid && warp_sche.io.barrier_busy(i))).asUInt.orR
-  val anyDmaFenceWaitBlockedInst = VecInit((0 until num_warp).map(i =>
-    ibuffer.io.out(i).valid && warp_sche.io.dma_fence_wait_dbg(i)
+  val anyTmaWaitBlockedInst = VecInit((0 until num_warp).map(i =>
+    ibuffer.io.out(i).valid && warp_sche.io.tma_wait_dbg(i)
   )).asUInt.orR
   val noIssueFire = !issueX.io.in.fire && !issueV.io.in.fire
   val noIssueInput = !issueX.io.in.valid && !issueV.io.in.valid
   val dataDepStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst && anyScoreExeBlockedInst
   val barrierStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst &&
     !anyScoreExeBlockedInst && anyBarrierBlockedInst
-  val dmaFenceWaitStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst &&
-    !anyScoreExeBlockedInst && !anyBarrierBlockedInst && anyDmaFenceWaitBlockedInst
-  val frontendStall = noIssueFire && noIssueInput && !dataDepStall && !barrierStall && !dmaFenceWaitStall
+  val tmaWaitStall = noIssueFire && noIssueInput && anyBufferedInst && !anySchedulableInst &&
+    !anyScoreExeBlockedInst && !anyBarrierBlockedInst && anyTmaWaitBlockedInst
+  val frontendStall = noIssueFire && noIssueInput && !dataDepStall && !barrierStall && !tmaWaitStall
 
   val flushEvent = warp_sche.io.flush.valid && !RegNext(warp_sche.io.flush.valid, false.B)
 
@@ -535,7 +577,7 @@ class pipe() extends Module{
     frontendStallCycles := 0.U
     lsuBackpressureCycles := 0.U
     ibufferFullCycles := 0.U
-    dmaFenceWaitStallCycles := 0.U
+    tmaWaitStallCycles := 0.U
     computeIssued := 0.U
     memIssued := 0.U
     ctrlIssued := 0.U
@@ -579,8 +621,8 @@ class pipe() extends Module{
     when(frontendStall){
       frontendStallCycles := frontendStallCycles + 1.U
     }
-    when(dmaFenceWaitStall){
-      dmaFenceWaitStallCycles := dmaFenceWaitStallCycles + 1.U
+    when(tmaWaitStall){
+      tmaWaitStallCycles := tmaWaitStallCycles + 1.U
     }
     when(flushEvent){
       controlHazardFlushCount := controlHazardFlushCount + 1.U
@@ -605,7 +647,7 @@ class pipe() extends Module{
     perf.frontendStallCycles := frontendStallCycles
     perf.lsuBackpressureCycles := lsuBackpressureCycles
     perf.ibufferFullCycles := ibufferFullCycles
-    perf.dmaFenceWaitStallCycles := dmaFenceWaitStallCycles
+    perf.tmaWaitStallCycles := tmaWaitStallCycles
   }
 
   io.perf_inst_class.foreach { perf =>

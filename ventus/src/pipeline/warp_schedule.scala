@@ -26,10 +26,9 @@ class warp_scheduler extends Module{
     val pc_rsp=Flipped(Valid(new ICachePipeRsp_np)) //icache miss state
     val branch = Flipped(DecoupledIO(new BranchCtrl)) //branch, flush pipeline
     val warp_control=Flipped(DecoupledIO(new warpSchedulerExeData)) //engprg and barrier
-    val dma_issue = Flipped(ValidIO(UInt(depth_warp.W)))
-    val dma_complete = Flipped(ValidIO(new DmaCompletion))
-    val dma_issue_allow = Output(Vec(num_warp, Bool()))
-    val dma_issue_group = Output(Vec(num_warp, UInt(log2Ceil(dma_group_entries).W)))
+    val dma_group_cmd = Decoupled(new DmaGroupCommand)
+    val dma_group_wait = Input(UInt(num_warp.W))
+    val dma_group_inflight = Input(Vec(num_warp, UInt(log2Ceil(max_dma_inst + 1).W)))
     val issued_warp=Flipped(Valid(UInt(depth_warp.W))) //not use
     val scoreboard_busy=Input(UInt(num_warp.W)) //scoreboard race
     val exe_busy=Input(UInt(num_warp.W)) //exe race
@@ -41,8 +40,13 @@ class warp_scheduler extends Module{
     val flush=(ValidIO(UInt(depth_warp.W)))
     val flushCache=(ValidIO(UInt(depth_warp.W)))
     val CTA2csr=ValidIO(new warpReqData) //redirect warpreq
-    val dma_fence_wait_dbg = Output(UInt(num_warp.W))
+    val tma_wait_dbg = Output(UInt(num_warp.W))
     val dma_inflight_dbg = Output(Vec(num_warp, UInt(log2Ceil(max_dma_inst + 1).W)))
+    val lsu_fence_end = Input(UInt(num_warp.W))
+    val dma_sync_cmd = Decoupled(new DmaSyncCommand)
+    val dma_sync_wait = Input(UInt(num_warp.W))
+    val dma_mbarrier_owner_busy = Input(UInt(num_block.W))
+    val dma_mbarrier_release = ValidIO(UInt(log2Ceil(num_block).W))
     //val ldst = Input(new warp_schedule_ldst_io()) // assume finish l2cache request
     //val switch = Input(Bool()) // assume coming from LDST unit (or other unit)
     val flushDCache = Decoupled(Bool())
@@ -53,13 +57,28 @@ class warp_scheduler extends Module{
 
   val warp_end=io.warp_control.fire&io.warp_control.bits.ctrl.simt_stack_op
   val warp_end_id=io.warp_control.bits.ctrl.wid
-  val is_dma_fence = io.warp_control.bits.ctrl.dma && io.warp_control.bits.ctrl.funct === 6.U
-  val warp_ctrl_is_dma_fence = io.warp_control.fire && is_dma_fence
-  val warp_ctrl_is_barrier = io.warp_control.fire && !io.warp_control.bits.ctrl.simt_stack_op && !is_dma_fence
+  val is_dma_group = io.warp_control.bits.ctrl.dma &&
+    io.warp_control.bits.ctrl.funct === TmaV2Spec.FunctS2GGroup.U
+  val is_dma_sync = io.warp_control.bits.ctrl.dma &&
+    io.warp_control.bits.ctrl.funct === TmaV2Spec.FunctMbarrierProxy.U
+  val dma_sync_op = io.warp_control.bits.ctrl.inst(26, 25)
+  val is_proxy_fence = is_dma_sync && dma_sync_op === TmaV2Spec.FenceProxyAsyncShared.U
+  val ctrl_ready_base = !io.branch.fire && !io.flushCache.valid
+  io.dma_group_cmd.valid := io.warp_control.valid && ctrl_ready_base && is_dma_group
+  io.dma_group_cmd.bits.wid := io.warp_control.bits.ctrl.wid
+  io.dma_group_cmd.bits.zimm := io.warp_control.bits.in1(4, 0)
+  io.dma_sync_cmd.valid := io.warp_control.valid && ctrl_ready_base && is_dma_sync && !is_proxy_fence
+  io.dma_sync_cmd.bits.wid := io.warp_control.bits.ctrl.wid
+  io.dma_sync_cmd.bits.owner := io.wg_id_tag(TAG_WIDTH - 1, log2Ceil(num_warp_in_a_block))
+  io.dma_sync_cmd.bits.op := dma_sync_op
+  io.dma_sync_cmd.bits.address := io.warp_control.bits.in1
+  io.dma_sync_cmd.bits.value := io.warp_control.bits.in2
+  val warp_ctrl_is_proxy = io.warp_control.fire && is_proxy_fence
+  val warp_ctrl_is_barrier = io.warp_control.fire && !io.warp_control.bits.ctrl.simt_stack_op &&
+    !is_dma_group && !is_dma_sync
   val current_warp=RegInit(0.U(depth_warp.W))
   val next_warp=WireInit(current_warp)
   io.branch.ready:= !io.flushCache.valid
-  io.warp_control.ready:= !io.branch.fire & !io.flushCache.valid
 
   io.warpReq.ready:=true.B
   io.warpRsp.valid:=warp_end // always ready.
@@ -129,6 +148,16 @@ class warp_scheduler extends Module{
   val warp_bar_data=RegInit(0.U(num_warp.W))  // 0 means not locked by barrier
   val warp_bar_belong=RegInit(VecInit(Seq.fill(num_block)(0.U(num_warp.W))))
 
+  val endingWarpMask = UIntToOH(warp_end_id, num_warp)
+  val lastWarpEnd = io.warp_control.valid && io.warp_control.bits.ctrl.simt_stack_op &&
+    !(warp_endprg_cnt(end_wg_id) & ~endingWarpMask).orR
+  val lastWarpBlocked = lastWarpEnd && io.dma_mbarrier_owner_busy(end_wg_id)
+  io.warp_control.ready := ctrl_ready_base &&
+    (!is_dma_group || io.dma_group_cmd.ready) &&
+    (!is_dma_sync || is_proxy_fence || io.dma_sync_cmd.ready) && !lastWarpBlocked
+  io.dma_mbarrier_release.valid := warp_end && lastWarpEnd
+  io.dma_mbarrier_release.bits := end_wg_id
+
 
   when(io.warpReq.fire){
     warp_bar_belong(new_wg_id):=warp_bar_belong(new_wg_id) | (1.U<<io.warpReq.bits.wid).asUInt  //显示warp中有哪些属于wg
@@ -185,170 +214,28 @@ class warp_scheduler extends Module{
 
 
   val warp_active=RegInit(0.U(num_warp.W))
-  require((dma_group_entries & (dma_group_entries - 1)) == 0,
-    "DMA group wait ring expects a power-of-two group count")
-  val dmaInflightWidth = log2Ceil(max_dma_inst + 1)
-  val dmaGroupWidth = log2Ceil(dma_group_entries)
-  val dmaGroupKeepWidth = log2Ceil(dma_group_entries + 1)
-  val maxInflightPerWarp = max_dma_inst.U(dmaInflightWidth.W)
-  val dma_inflight_cnt = RegInit(VecInit(Seq.fill(num_warp)(0.U(dmaInflightWidth.W))))
-  val dma_fence_wait = RegInit(VecInit(Seq.fill(num_warp)(false.B)))
-  val dma_wait_target = RegInit(VecInit(Seq.fill(num_warp)(0.U(dmaInflightWidth.W))))
-  // A per-warp group ring tracks all DMA operations. DMA instructions begin
-  // execution immediately and are assigned to the current open group; commit
-  // closes that group and advances the issue pointer, while wait_group keeps
-  // only the newest committed groups outstanding.
-  val dma_group_issue_ptr = RegInit(VecInit(Seq.fill(num_warp)(0.U(dmaGroupWidth.W))))
-  val dma_group_open = RegInit(VecInit(Seq.fill(num_warp)(false.B)))
-  val dma_group_wait = RegInit(VecInit(Seq.fill(num_warp)(false.B)))
-  val dma_group_wait_keep = RegInit(VecInit(Seq.fill(num_warp)(0.U(dmaGroupKeepWidth.W))))
-  val dma_group_committed = RegInit(VecInit(Seq.fill(num_warp)(
-    VecInit(Seq.fill(dma_group_entries)(false.B))
-  )))
-  val dma_group_count = RegInit(VecInit(Seq.fill(num_warp)(
-    VecInit(Seq.fill(dma_group_entries)(0.U(dmaInflightWidth.W)))
-  )))
-  val dma_issue_allow = Wire(Vec(num_warp, Bool()))
-  val dma_fence_zimm = io.warp_control.bits.in1(4, 0)
-  val dma_fence_wait_count = dma_fence_zimm.pad(dmaInflightWidth)(dmaInflightWidth - 1, 0)
-  val dma_fence_group_commit = dma_fence_zimm === 16.U
-  val dma_fence_group_wait = dma_fence_zimm(4) && dma_fence_zimm(3)
-  val dma_fence_legacy_wait = !dma_fence_group_commit && !dma_fence_group_wait
-  val dma_fence_group_keep = dma_fence_zimm(2, 0).pad(dmaGroupKeepWidth)(dmaGroupKeepWidth - 1, 0)
-
-  def groupBehind(ptr: UInt, distance: Int): UInt =
-    (ptr - distance.U)(dmaGroupWidth - 1, 0)
-
-  def groupIsRecent(ptr: UInt, group: UInt, keep: UInt): Bool =
-    (1 to dma_group_entries).map { d =>
-      keep >= d.U && group === groupBehind(ptr, d)
-    }.reduce(_ || _)
-
-  for (i <- 0 until num_warp) {
-    val issue_hit = io.dma_issue.valid && io.dma_issue.bits === i.U
-    val complete_hit = io.dma_complete.valid && io.dma_complete.bits.wid === i.U
-    val can_inc = dma_inflight_cnt(i) =/= maxInflightPerWarp
-    val group_issue_slot_free = !dma_group_committed(i)(dma_group_issue_ptr(i))
-    val allow_issue = (can_inc || complete_hit) && group_issue_slot_free
-    val inc_en = issue_hit && allow_issue
-    val dec_en = complete_hit && dma_inflight_cnt(i) =/= 0.U
-    val cnt_after_io = dma_inflight_cnt(i) + inc_en.asUInt - dec_en.asUInt
-    val fence_issue_here = warp_ctrl_is_dma_fence && io.warp_control.bits.ctrl.wid === i.U
-    val fence_legacy_here = fence_issue_here && dma_fence_legacy_wait
-    val fence_group_commit_here = fence_issue_here && dma_fence_group_commit
-    val fence_group_wait_here = fence_issue_here && dma_fence_group_wait
-    val fence_wait_all = dma_fence_wait_count === 0.U || dma_fence_wait_count >= cnt_after_io
-    val fence_wait_count = Mux(fence_wait_all, cnt_after_io, dma_fence_wait_count)
-    val fence_target = cnt_after_io - fence_wait_count
-    val fence_done = cnt_after_io <= dma_wait_target(i)
-    val group_count_next = Wire(Vec(dma_group_entries, UInt(dmaInflightWidth.W)))
-    val group_committed_next = Wire(Vec(dma_group_entries, Bool()))
-    val commit_group_has_work = dma_group_open(i) || dma_group_count(i)(dma_group_issue_ptr(i)) =/= 0.U
-    val commit_group_advances = fence_group_commit_here && commit_group_has_work
-    val group_ptr_next = Mux(
-      commit_group_advances,
-      (dma_group_issue_ptr(i) + 1.U)(dmaGroupWidth - 1, 0),
-      dma_group_issue_ptr(i)
-    )
-
-    for (g <- 0 until dma_group_entries) {
-      val group_inc = inc_en && dma_group_issue_ptr(i) === g.U
-      val group_dec = complete_hit && io.dma_complete.bits.group === g.U && dma_group_count(i)(g) =/= 0.U
-      group_count_next(g) := dma_group_count(i)(g) + group_inc.asUInt - group_dec.asUInt
-      group_committed_next(g) := dma_group_committed(i)(g)
-      when(group_count_next(g) === 0.U) {
-        group_committed_next(g) := false.B
-      }
-      when(fence_group_commit_here && commit_group_has_work &&
-           dma_group_issue_ptr(i) === g.U && group_count_next(g) =/= 0.U) {
-        group_committed_next(g) := true.B
-      }
-    }
-
-    val group_wait_blocked_saved = VecInit((0 until dma_group_entries).map { g =>
-      group_committed_next(g) && group_count_next(g) =/= 0.U &&
-        !groupIsRecent(dma_group_issue_ptr(i), g.U, dma_group_wait_keep(i))
-    }).asUInt.orR
-    val group_wait_blocked_new = VecInit((0 until dma_group_entries).map { g =>
-      group_committed_next(g) && group_count_next(g) =/= 0.U &&
-        !groupIsRecent(dma_group_issue_ptr(i), g.U, dma_fence_group_keep)
-    }).asUInt.orR
-    val group_wait_done_saved = dma_group_wait_keep(i) >= dma_group_entries.U || !group_wait_blocked_saved
-    val group_wait_done_new = dma_fence_group_keep >= dma_group_entries.U || !group_wait_blocked_new
-    val group_open_after_commit = Mux(commit_group_advances, false.B, dma_group_open(i) || inc_en)
-    val group_open_next = group_open_after_commit && group_count_next(group_ptr_next) =/= 0.U
-    val clear_group_state = io.pc_reset || (io.warpReq.fire && io.warpReq.bits.wid === i.U)
-
-    dma_issue_allow(i) := allow_issue
-
-    when(!reset.asBool) {
-      assert(!(issue_hit && !allow_issue), s"DMA inflight overflow on warp $i")
-      assert(!(complete_hit && dma_inflight_cnt(i) === 0.U && !issue_hit), s"DMA inflight underflow on warp $i")
-      assert(!(complete_hit && dma_group_count(i)(io.dma_complete.bits.group) === 0.U &&
-        !(inc_en && dma_group_issue_ptr(i) === io.dma_complete.bits.group)),
-        s"DMA group counter underflow on warp $i")
-      when(io.warpReq.fire && io.warpReq.bits.wid === i.U) {
-        assert(dma_inflight_cnt(i) === 0.U, s"Warp reuse before DMA inflight drains on warp $i")
-        assert(!dma_fence_wait(i), s"Warp reuse while DMA fence wait is still set on warp $i")
-        assert(!dma_group_wait(i), s"Warp reuse while DMA group wait is still set on warp $i")
-      }
-    }
-
-    dma_inflight_cnt(i) := Mux(io.pc_reset, 0.U, cnt_after_io)
-    dma_wait_target(i) := Mux(
-      io.pc_reset,
-      0.U,
-      Mux(
-        fence_legacy_here,
-        fence_target,
-        Mux(fence_done, 0.U, dma_wait_target(i))
-      )
-    )
-    dma_fence_wait(i) := Mux(
-      io.pc_reset,
-      false.B,
-      Mux(
-        fence_legacy_here,
-        fence_target =/= cnt_after_io,
-        Mux(fence_done, false.B, dma_fence_wait(i))
-      )
-    )
-    dma_group_issue_ptr(i) := Mux(clear_group_state, 0.U, group_ptr_next)
-    dma_group_open(i) := Mux(clear_group_state, false.B, group_open_next)
-    dma_group_wait_keep(i) := Mux(
-      clear_group_state,
-      0.U,
-      Mux(fence_group_wait_here, dma_fence_group_keep, dma_group_wait_keep(i))
-    )
-    dma_group_wait(i) := Mux(
-      clear_group_state,
-      false.B,
-      Mux(
-        fence_group_wait_here,
-        !group_wait_done_new,
-        Mux(group_wait_done_saved, false.B, dma_group_wait(i))
-      )
-    )
-    for (g <- 0 until dma_group_entries) {
-      dma_group_count(i)(g) := Mux(clear_group_state, 0.U, group_count_next(g))
-      dma_group_committed(i)(g) := Mux(clear_group_state, false.B, group_committed_next(g))
+  val dma_proxy_wait = RegInit(VecInit(Seq.fill(num_warp)(false.B)))
+  for (wid <- 0 until num_warp) {
+    val resetWarp = io.pc_reset || (io.warpReq.fire && io.warpReq.bits.wid === wid.U)
+    val proxyHere = warp_ctrl_is_proxy && io.warp_control.bits.ctrl.wid === wid.U
+    dma_proxy_wait(wid) := Mux(resetWarp, false.B,
+      Mux(proxyHere, !io.lsu_fence_end(wid),
+        Mux(io.lsu_fence_end(wid), false.B, dma_proxy_wait(wid))))
+    when(!reset.asBool && io.warpReq.fire && io.warpReq.bits.wid === wid.U) {
+      assert(!dma_proxy_wait(wid), s"Warp reuse while DMA proxy fence is still set on warp $wid")
     }
   }
-
-  io.dma_issue_allow := dma_issue_allow
-  io.dma_issue_group := dma_group_issue_ptr
 
 
 
   warp_active:=(warp_active | ((1.U<<io.warpReq.bits.wid).asUInt&Fill(num_warp,io.warpReq.fire))) & (~( Fill(num_warp,warp_end)&(1.U<<warp_end_id).asUInt )).asUInt
-  val dma_fence_wait_bits = Cat(dma_fence_wait.reverse)
-  val dma_group_wait_bits = Cat(dma_group_wait.reverse)
-  val dma_wait_bits = dma_fence_wait_bits | dma_group_wait_bits
+  val dma_proxy_wait_bits = Cat(dma_proxy_wait.reverse)
+  val dma_wait_bits = io.dma_group_wait | dma_proxy_wait_bits | io.dma_sync_wait
   val warp_ready=(~(warp_bar_data | io.scoreboard_busy | io.exe_busy | (~warp_active).asUInt | dma_wait_bits)).asUInt
   io.warp_ready:=warp_ready
   io.barrier_busy := warp_bar_data
-  io.dma_fence_wait_dbg := dma_wait_bits
-  io.dma_inflight_dbg := dma_inflight_cnt
+  io.tma_wait_dbg := dma_wait_bits
+  io.dma_inflight_dbg := io.dma_group_inflight
   for (i<- num_warp-1 to 0 by -1){
     pc_ready(i):= io.pc_ibuffer_ready(i) & warp_active(i) 
     when(pc_ready(i)){next_warp:=i.asUInt}

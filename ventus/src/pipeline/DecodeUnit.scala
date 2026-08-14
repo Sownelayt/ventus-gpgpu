@@ -491,13 +491,14 @@ object IDecodeLUT_VC{
     //VBTTA_VV->List(Y,Y,N,B_N,N,N,CSR.N,N,A3_VRS3,A2_VRS2,A1_VRS1,IMM_X,MEM_X,FN_TTB,N,M_X,N,N,N,Y,N,N,N,Y,N,N,N),
 
     // DMA/TMA instructions (opcode = 1000010)
-    CP_ASYNC_COPYSIZE ->  List(N, N, N, B_N, N, N, CSR.N, N, A3_FRS3, A2_RS2, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
     CP_ASYNC_BULK ->      List(N, N, N, B_N, N, N, CSR.N, N, A3_FRS3, A2_RS2, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
     CP_ASYNC_TENSOR ->    List(N, N, N, B_N, N, N, CSR.N, N, A3_FRS3, A2_VRS2, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
     CP_ASYNC_BULK_S2G ->  List(N, N, N, B_N, N, N, CSR.N, N, A3_FRS3, A2_RS2, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
     CP_ASYNC_TENSOR_S2G -> List(N, N, N, B_N, N, N, CSR.N, N, A3_FRS3, A2_VRS2, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
     PREFETCH_TENSORMAP -> List(N, N, N, B_N, N, N, CSR.N, N, A3_X, A2_X, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
-    CP_ASYNC_FENCE ->     List(N, N, Y, B_N, N, N, CSR.N, N, A3_X, A2_X, A1_IMM, IMM_Z, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
+    INVALIDATE_TENSORMAP -> List(N, N, N, B_N, N, N, CSR.N, N, A3_X, A2_X, A1_RS1, IMM_S, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
+    CP_ASYNC_S2G_GROUP -> List(N, N, Y, B_N, N, N, CSR.N, N, A3_X, A2_X, A1_IMM, IMM_Z, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
+    CP_ASYNC_MBARRIER_PROXY -> List(N, N, Y, B_N, N, N, CSR.N, N, A3_X, A2_RS2, A1_RS1, IMM_X, MEM_X, FN_ADD, N, M_X, N, N, N, N, N, N, N, N, N, N, N),
   )
 }
 
@@ -637,7 +638,6 @@ class InstrDecodeV2 extends Module {
     c.aq :=s(26) & io.inst(i)(26)
     c.rl:=s(26) & io.inst(i)(25)
     // DMA control signals
-    c.copysize := io.inst(i)(26, 25)
     c.funct := io.inst(i)(14, 12).asUInt
     c.dma := Mux(io.inst(i)(6, 0) === "b1000010".U, true.B, false.B)
     c.dma_group := 0.U

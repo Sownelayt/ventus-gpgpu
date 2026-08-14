@@ -21,11 +21,11 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
   val INST_CNT_2: Boolean = false
   val PMU_PIPELINE: Boolean = true
   val PMU_INST_CLASS: Boolean = true
-  // Normal simulation keeps DMA PMU visibility. Final/DC elaboration can
-  // remove the counters and their aggregation logic with environment flags.
-  val PMU_DMA_S2G: Boolean = envFlag("VENTUS_PMU_DMA_S2G", default = true)
-  val PMU_DMA_S2G_DETAIL: Boolean = PMU_DMA_S2G &&
-    envFlag("VENTUS_PMU_DMA_S2G_DETAIL", default = true)
+  // Normal builds omit TMA PMU state. Performance-analysis builds opt in
+  // explicitly; detail counters additionally require the detail flag.
+  val PMU_TMA: Boolean = envFlag("VENTUS_PMU_TMA", default = false)
+  val PMU_TMA_DETAIL: Boolean = PMU_TMA &&
+    envFlag("VENTUS_PMU_TMA_DETAIL", default = false)
   val GVM_ENABLED: Boolean = sys.env.getOrElse("RTL_GVM_ENABLED", "false").toBoolean
   val MMU_ENABLED: Boolean = false
   val DCACHE_DEBUG: Boolean = false
@@ -159,25 +159,7 @@ object parameters { //notice log2Ceil(4) returns 2.that is ,n is the total num, 
 
   // DMA parameters
   def max_dma_inst = if(num_warp >= 4) num_warp else 4  // max DMA instructions in flight
-  def max_dma_tag = 8
-  def max_l2cacheline = 6
-  def s2g_line_entries = 4
-  def s2g_shared_read_entries = {
-    val maxByLine = s2g_line_entries * 2
-    if (lsu_nMshrEntry < maxByLine) lsu_nMshrEntry else maxByLine
-  }
-  def s2g_completion_entries = 4
   def dma_group_entries = 4
-  def tma_desc_cache_entries = 2
-  def tma_prefetch_slots = 2
-  def dma_data_width = num_thread * xLen  // DMA data width matches L2 cacheline
-  def dma_temp_mem_depth = 8  // depth of temporary memory in DMA
-  def BitsOfByte = 8
-  def dma_aligned_bulk = 4  // 4 bytes alignment
-  def l2cacheline = dcache_BlockWords * BytesOfWord  // bytes per L2 cacheline
-  def addr_tag_bits = xLen - log2Ceil(l2cacheline)
-  def numgroupl2cache = l2cacheline / dma_aligned_bulk
-  def numgroupshared = num_thread  // number of groups sent to shared memory per transfer
 
   val LDS_BASE = 0x70000000  // LDS base address: a hyperparameter used within each SM
 

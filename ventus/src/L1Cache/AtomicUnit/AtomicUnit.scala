@@ -198,7 +198,7 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
   val memRsp_m = Wire(new TLBundleD_lite_plus(params_in))
   val SCFailRsp = Wire(new TLBundleD_lite_plus(params_in))
   val memReq_m = Wire(new TLBundleA_lite_custom(params_in))
-  val idle :: issueGet :: issuePut :: Nil = Enum(3)
+  val idle :: waitGetRsp :: issuePutReq :: waitPutRsp :: Nil = Enum(4)
   val state = RegInit(idle)
   val nextState = Wire(UInt(2.W))
   // modules
@@ -219,6 +219,8 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
   val atomicReqValid = Wire(Bool())
   val memRspAtomicReady = Wire(Bool())
   val atomicReq = Reg(new AtomicReq)
+  val atomicSource = Reg(UInt(params_in.source_bits.W))
+  val atomicOldData = Reg(UInt(params_in.data_bits.W))
   val atomicL2Req = Wire(new TLBundleA_lite_custom(params_in))
   val atomicRspValid = Wire(Bool())
   val atomicL1Rsp = Wire(new TLBundleD_lite_plus(params_in))
@@ -227,7 +229,10 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
   atomicDataInMask.io.din := io.L12ATUmemReq.bits.data
   atomicDataInMask.io.mask := io.L12ATUmemReq.bits.mask
   val L2DataInMask = Module(new maskdata(dcache_BlockWords, xLen, BytesOfWord))
-  L2DataInMask.io.din := io.L22ATUmemRsp.bits.data
+  // The Get response is consumed independently of the later Put request.
+  // Use the captured cache line, never the live D-channel bits after valid
+  // drops or an unrelated response takes the channel.
+  L2DataInMask.io.din := atomicOldData
   L2DataInMask.io.mask := atomicL2Req.mask
   val atomicDataOutMask = Module(new putdata(dcache_BlockWords, xLen,BytesOfWord))
   val atomicOpResult = atomicReq.computeAtomicResult(L2DataInMask.io.dout)
@@ -240,8 +245,17 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
     (req.opcode === TLAOp_Arith) ||  // Arithmetic AMO
     (req.opcode === TLAOp_Logic)     // Logical AMO
   }
+  def atomicTaggedSource(source: UInt): UInt = {
+    // L2 itself carries source_bits, so the older source_bits_custom prefix is
+    // truncated at the Scheduler boundary.  Reserve the otherwise-invalid
+    // cache requester ID 3 inside the source bits that L2 actually preserves
+    // (valid requesters are ICache=0, DCache=1, and TMA=2).
+    Cat(source(params_in.source_bits - 1, l1cache_sourceBits + 2),
+      "b11".U(2.W), source(l1cache_sourceBits - 1, 0))
+  }
   def isAtomicResponse(resp: TLBundleD_lite_plus_custom): Bool = {
-    (resp.source.head(2) === "b11".U)
+    (state =/= idle) &&
+      (resp.source === atomicTaggedSource(atomicSource))
   }
 
   a_source_up := 0.U
@@ -293,7 +307,7 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
     is(idle){
       memRspAtomicReady := false.B
       when(isAtomicRequest(io.L12ATUmemReq.bits) && io.L12ATUmemReq.valid && io.ATU2L2memReq.ready){
-        nextState := issueGet
+        nextState := waitGetRsp
       }.otherwise{
         nextState := idle
       }
@@ -303,51 +317,63 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
       atomicReq.a_data    := atomicDataInMask.io.dout
       atomicReq.a_opcode  := io.L12ATUmemReq.bits.opcode
       atomicReq.a_param   := io.L12ATUmemReq.bits.param
+      atomicSource        := io.L12ATUmemReq.bits.source
       atomicL2Req.opcode  := TLAOp_Get
       atomicL2Req.address := io.L12ATUmemReq.bits.address
       atomicL2Req.mask    := io.L12ATUmemReq.bits.mask
       atomicL2Req.param   := 0.U
       atomicL2Req.data    := DontCare
-      atomicL2Req.source  := Cat("b11".U,0.U(InfWriteEntryBits.W),io.L12ATUmemReq.bits.source)
-      atomicL2Req.source  := Cat("b11".U,0.U(InfWriteEntryBits.W),io.L12ATUmemReq.bits.source)   
-      when(nextState === issueGet){ 
-       memRspAtomicReady := true.B           
+      // Internal Get/Put traffic occupies the invalid cache-requester ID 3.
+      // Ordinary L1 traffic may keep flowing while an AMO is in progress, so
+      // reusing its untagged source can otherwise mistake an unrelated response
+      // for the AMO Get or Put acknowledgement.
+      atomicL2Req.source  :=
+        atomicTaggedSource(io.L12ATUmemReq.bits.source)
+    }
+    is(waitGetRsp){
+      when(io.L22ATUmemRsp.valid && isAtomicResponse(io.L22ATUmemRsp.bits)){
+        atomicOldData := io.L22ATUmemRsp.bits.data
+        nextState := issuePutReq
+      }.otherwise{
+        nextState := waitGetRsp
       }
+      // The Get response has its own register boundary.  It must not depend on
+      // L2 A-channel readiness: coupling D.ready to A.ready can deadlock when
+      // other misses fill the L2 MSHRs and need the blocked D channel to drain.
+      memRspAtomicReady := true.B
     }
-    is(issueGet){
-      when(io.L22ATUmemRsp.valid && (isAtomicResponse(io.L22ATUmemRsp.bits)) && io.ATU2L2memReq.ready && io.ATU2L1memRsp.ready){
-        nextState := issuePut
-    }.otherwise{
-      nextState := issueGet
+    is(issuePutReq){
+      when(io.ATU2L2memReq.ready){
+        nextState := waitPutRsp
+      }.otherwise{
+        nextState := issuePutReq
+      }
+      atomicReqValid := true.B
+      atomicL2Req.opcode  := TLAOp_PutPart
+      atomicL2Req.address := atomicReq.a_addr
+      atomicL2Req.mask    := atomicReq.a_mask.asUInt
+      atomicL2Req.param   := 0.U
+      atomicL2Req.data    := atomicOpResultDataPut
+      atomicL2Req.source  := atomicTaggedSource(atomicSource)
     }
-    memRspAtomicReady := io.ATU2L1memRsp.ready
-    
-    atomicReqValid := io.L22ATUmemRsp.valid && (isAtomicResponse(io.L22ATUmemRsp.bits))
-    atomicL1Rsp.opcode  := 1.U
-    atomicL1Rsp.data    := io.L22ATUmemRsp.bits.data
-    atomicL1Rsp.source  := io.L22ATUmemRsp.bits.source.tail(2+InfWriteEntryBits)
-    atomicL1Rsp.param   := 2.U //indicate atomic Rsp
-
-    atomicL2Req.opcode  := TLAOp_PutPart
-    atomicL2Req.address := atomicReq.a_addr
-    atomicL2Req.mask    := atomicReq.a_mask.asUInt
-    atomicL2Req.param   := 0.U
-    atomicL2Req.data    := atomicOpResultDataPut
-    atomicL2Req.source  := io.L22ATUmemRsp.bits.source
-    atomicRspValid := io.L22ATUmemRsp.valid && (isAtomicResponse(io.L22ATUmemRsp.bits)) && io.ATU2L2memReq.ready
-  //  when(nextState === issuePut){
-  //    atomicRspValid := true.B
-  //}
-}
-  is(issuePut){
-    when(io.L22ATUmemRsp.valid && (isAtomicResponse(io.L22ATUmemRsp.bits))){
-      nextState := idle
-    }.otherwise{
-      nextState := issuePut
+    is(waitPutRsp){
+      val finalAtomicResponse = io.L22ATUmemRsp.valid &&
+        isAtomicResponse(io.L22ATUmemRsp.bits)
+      when(finalAtomicResponse && io.ATU2L1memRsp.ready){
+        nextState := idle
+      }.otherwise{
+        nextState := waitPutRsp
+      }
+      // The architectural AMO response is delayed until the internal Put is
+      // acknowledged.  LSU still receives the old value; TMA ignores data.
+      atomicRspValid := finalAtomicResponse
+      atomicL1Rsp.opcode := 1.U
+      atomicL1Rsp.data := atomicOldData
+      atomicL1Rsp.source := atomicSource
+      atomicL1Rsp.param := 2.U
+      memRspAtomicReady := io.ATU2L1memRsp.ready
     }
-    memRspAtomicReady := true.B
   }
-}
 // memReq handler
   SCFailRsp_valid := false.B
   memReq_s_ready := io.ATU2L2memReq.ready
@@ -361,7 +387,13 @@ class AtomicUnit (params_in : InclusiveCacheParameters_lite)(implicit p: Paramet
   resTabAddr := 0.U
   resTabMask := VecInit(Seq.fill(dcache_BlockWords)(0.U(BytesOfWord.W)))
   val memReq_s_fire = memReq_s_ready && io.L12ATUmemReq.valid
-  when(io.L12ATUmemReq.valid && !atomicReqValid ){ // continue issue request when L2 req is not occupied by atomic req
+  when(io.L12ATUmemReq.valid && state =/= idle &&
+      isAtomicRequest(io.L12ATUmemReq.bits)) {
+    // A bank executes one AMO at a time.  Never leak a second AMO through the
+    // ordinary pass-through path while the internal Get/Put is in progress.
+    memReq_s_ready := false.B
+    memReq_m_valid := false.B
+  }.elsewhen(io.L12ATUmemReq.valid && !atomicReqValid ){ // continue issue request when L2 req is not occupied by atomic req
     when(io.L12ATUmemReq.bits.opcode === TLAOp_Get){ // read and LR
       memReq_s_ready := io.ATU2L2memReq.ready
       memReq_m_valid := true.B
@@ -485,12 +517,5 @@ class putdata (width : Int, length : Int, nByte:Int) extends Module{
     Mux(maskOrMerge(i), io.din, 0.U)
   }).asUInt
 }
-
-
-
-
-
-
-
 
 

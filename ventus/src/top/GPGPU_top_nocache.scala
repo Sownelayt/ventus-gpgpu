@@ -6,7 +6,7 @@ import L1Cache.MyConfig
 import L1Cache.ICache.{InstructionCache, ICacheMemReq_p, ICacheMemRsp, ICacheBundle}
 import pipeline.{CTAreqData, CTArspData, CTA2warp, pipe}
 import pipeline.{ICachePipeReq_np, ICachePipeRsp_np, DCacheCoreReq_np, DCacheCoreRsp_np, ShareMemCoreReq_np}
-import pipeline.{InstClassPerfCounters, PipelinePerfCounters, S2GPerfCounters}
+import pipeline.{InstClassPerfCounters, PipelinePerfCounters, TmaPerfCounters}
 import L1Cache.ShareMem.SharedMemory
 import chisel3.experimental.hierarchy.{Definition, Instance, instantiable, public, Instantiate}
 import config.config.Parameters
@@ -39,7 +39,7 @@ class SM_wrapper_nocache() extends Module {
     val perfReset = Input(Bool())
     val pipeline_perf = if(PMU_PIPELINE) Some(Output(new PipelinePerfCounters)) else None
     val inst_class_perf = if(PMU_INST_CLASS) Some(Output(new InstClassPerfCounters)) else None
-    val s2g_perf = if(PMU_DMA_S2G) Some(Output(new S2GPerfCounters)) else None
+    val tma_perf = if(PMU_TMA) Some(Output(new TmaPerfCounters)) else None
     val icache_invalidate = Input(Bool())
   })
 
@@ -53,7 +53,7 @@ class SM_wrapper_nocache() extends Module {
   pipe.io.perfReset := io.perfReset
   io.pipeline_perf.foreach(_ := pipe.io.perf_pipeline.getOrElse(0.U.asTypeOf(new PipelinePerfCounters)))
   io.inst_class_perf.foreach(_ := pipe.io.perf_inst_class.getOrElse(0.U.asTypeOf(new InstClassPerfCounters)))
-  io.s2g_perf.foreach(_ := pipe.io.perf_s2g.getOrElse(0.U.asTypeOf(new S2GPerfCounters)))
+  io.tma_perf.foreach(_ := pipe.io.perf_tma.getOrElse(0.U.asTypeOf(new TmaPerfCounters)))
 
   val cnt = Counter(10)
   when(cnt.value < 5.U) { cnt.inc() }
@@ -71,6 +71,7 @@ class SM_wrapper_nocache() extends Module {
   sharedmem.io.coreReq.bits.data := sharedReqArb.io.out.bits.data
   sharedmem.io.coreReq.bits.instrId := sharedReqArb.io.out.bits.instrId
   sharedmem.io.coreReq.bits.isWrite := sharedReqArb.io.out.bits.isWrite
+  sharedmem.io.coreReq.bits.isMBarrier := sharedReqArb.io.out.bits.isMBarrier
   sharedmem.io.coreReq.bits.setIdx := sharedReqArb.io.out.bits.setIdx
   sharedmem.io.coreReq.bits.perLaneAddr := sharedReqArb.io.out.bits.perLaneAddr
   sharedmem.io.coreReq.bits.sourceTag := sharedReqArb.io.chosen === 1.U
@@ -87,6 +88,7 @@ class SM_wrapper_nocache() extends Module {
   pipe.io.dma_shared_rsp.bits.instrId := sharedmem.io.coreRsp.bits.instrId
   pipe.io.dma_shared_rsp.bits.activeMask := sharedmem.io.coreRsp.bits.activeMask
   pipe.io.dma_shared_rsp.bits.isWrite := sharedmem.io.coreRsp.bits.isWrite
+  pipe.io.dma_shared_rsp.bits.isMBarrier := sharedmem.io.coreRsp.bits.isMBarrier
   sharedmem.io.coreRsp.ready := Mux(sharedRspFromDma, pipe.io.dma_shared_rsp.ready, pipe.io.shared_rsp.ready)
 
   val icache = Module(new InstructionCache()(param))
@@ -115,6 +117,23 @@ class SM_wrapper_nocache() extends Module {
   val dmaDcacheReq = Wire(DecoupledIO(new DCacheCoreReq_np))
   val dmaLineAddr = pipe.io.dma_cache_req.bits.a_addr.get
   val dmaBlockByteBits = log2Ceil(dcache_BlockWords * BytesOfWord)
+  val dmaTlOpcode = pipe.io.dma_cache_req.bits.a_opcode
+  val dmaTlParam = pipe.io.dma_cache_req.bits.a_param
+  val dmaIsAtomic = dmaTlOpcode === 2.U || dmaTlOpcode === 3.U
+  val dmaCoreAtomicParam = Mux(dmaTlOpcode === 2.U,
+    MuxLookup(dmaTlParam, 0.U)(Seq(
+      0.U -> 4.U, // signed min
+      1.U -> 5.U, // signed max
+      2.U -> 6.U, // unsigned min
+      3.U -> 7.U, // unsigned max
+      4.U -> 0.U  // add
+    )),
+    MuxLookup(dmaTlParam, 1.U)(Seq(
+      0.U -> 1.U,  // xor
+      1.U -> 2.U,  // or
+      2.U -> 3.U,  // and
+      3.U -> 15.U  // swap
+    )))
   dmaDcacheReq.valid := pipe.io.dma_cache_req.valid
   pipe.io.dma_cache_req.ready := dmaDcacheReq.ready
   dmaDcacheReq.bits.instrId := 0.U
@@ -122,14 +141,20 @@ class SM_wrapper_nocache() extends Module {
   dmaDcacheReq.bits.setIdx := dmaLineAddr(dmaBlockByteBits + dcache_SetIdxBits - 1, dmaBlockByteBits)
   dmaDcacheReq.bits.asid.foreach(_ := 0.U)
   dmaDcacheReq.bits.opcode := Mux(
-    pipe.io.dma_cache_req.bits.a_opcode === 4.U,
+    dmaTlOpcode === 4.U,
     0.U,
-    Mux(pipe.io.dma_cache_req.bits.a_opcode === 0.U || pipe.io.dma_cache_req.bits.a_opcode === 1.U, 1.U, 3.U)
+    Mux(dmaTlOpcode === 0.U || dmaTlOpcode === 1.U, 1.U,
+      Mux(dmaIsAtomic, 2.U, 3.U))
   )
-  dmaDcacheReq.bits.param := pipe.io.dma_cache_req.bits.a_param.pad(4)
+  dmaDcacheReq.bits.param := Mux(dmaIsAtomic,
+    dmaCoreAtomicParam, dmaTlParam.pad(4))
   dmaDcacheReq.bits.spike_info.foreach(_ := DontCare)
   (0 until num_thread).foreach { i =>
-    dmaDcacheReq.bits.perLaneAddr(i).activeMask := pipe.io.dma_cache_req.bits.a_mask(i).orR
+    // TileLink Get does not use a_mask.  The nocache endpoint must fetch the
+    // complete cache line; the TMA engine applies its own payload byte mask
+    // after the response returns.
+    dmaDcacheReq.bits.perLaneAddr(i).activeMask :=
+      dmaTlOpcode === 4.U || pipe.io.dma_cache_req.bits.a_mask(i).orR
     dmaDcacheReq.bits.perLaneAddr(i).blockOffset := i.U
     dmaDcacheReq.bits.perLaneAddr(i).wordOffset1H := pipe.io.dma_cache_req.bits.a_mask(i)
     dmaDcacheReq.bits.data(i) := pipe.io.dma_cache_req.bits.a_data(i)
@@ -190,8 +215,8 @@ class SM_wrapper_nocache() extends Module {
     gvm_cta2warp.io.rtl_num_thread := cta2warp.io.warpReq.bits.CTAdata.dispatch2cu_wf_size_dispatch.pad(32)
   }
 
-  // fence_end_dma: consumed inside pipe by warp scheduler; sink for observability.
-  pipe.io.fence_end_dma.ready := true.B
+  // tma_completion: consumed inside pipe by warp scheduler; sink for observability.
+  pipe.io.tma_completion.ready := true.B
   // DMA TLB: identity-mapping bypass (nocache variant has no L1 TLB)
   val dma_tlb_state = RegInit(false.B) // false=idle, true=reply
   val dma_tlb_paddr = Reg(UInt(mmu.SV32.paLen.W))
@@ -234,12 +259,18 @@ class GPGPU_top_nocache() extends Module {
   def sumInstClassPerfCounter(select: InstClassPerfCounters => UInt): UInt = {
     if (PMU_INST_CLASS) sm_wrapper.map(sm => select(sm.inst_class_perf.get)).reduce(_ + _) else 0.U(64.W)
   }
-  def sumS2GPerfCounter(select: S2GPerfCounters => UInt): UInt = {
-    if (PMU_DMA_S2G) sm_wrapper.map(sm => select(sm.s2g_perf.get)).reduce(_ + _) else 0.U(64.W)
+  def sumTmaPerfCounter(select: TmaPerfCounters => UInt): UInt = {
+    if (PMU_TMA) sm_wrapper.map(sm => select(sm.tma_perf.get)).reduce(_ + _) else 0.U(64.W)
   }
-  def zeroS2GPerf: S2GPerfCounters = 0.U.asTypeOf(new S2GPerfCounters)
-  def addS2GPerf(a: S2GPerfCounters, b: S2GPerfCounters): S2GPerfCounters = {
-    val sum = Wire(new S2GPerfCounters)
+  def maxTmaPerfCounter(select: TmaPerfCounters => UInt): UInt = {
+    if (PMU_TMA)
+      sm_wrapper.map(sm => select(sm.tma_perf.get)).reduce(
+        (a, b) => Mux(a > b, a, b))
+    else 0.U(64.W)
+  }
+  def zeroTmaPerf: TmaPerfCounters = 0.U.asTypeOf(new TmaPerfCounters)
+  def addTmaPerf(a: TmaPerfCounters, b: TmaPerfCounters): TmaPerfCounters = {
+    val sum = Wire(new TmaPerfCounters)
     sum.instIssued := a.instIssued + b.instIssued
     sum.lineIssued := a.lineIssued + b.lineIssued
     sum.putFull := a.putFull + b.putFull
@@ -248,11 +279,79 @@ class GPGPU_top_nocache() extends Module {
     sum.sharedReadReq := a.sharedReadReq + b.sharedReadReq
     sum.sharedReadRsp := a.sharedReadRsp + b.sharedReadRsp
     sum.tlbReq := a.tlbReq + b.tlbReq
-    sum.ackCount := a.ackCount + b.ackCount
-    sum.ackLatencySum := a.ackLatencySum + b.ackLatencySum
     sum.lineFullStallCycles := a.lineFullStallCycles + b.lineFullStallCycles
-    sum.readEntryFullStallCycles := a.readEntryFullStallCycles + b.readEntryFullStallCycles
     sum.ackTagFullStallCycles := a.ackTagFullStallCycles + b.ackTagFullStallCycles
+    sum.commandSlotFullStallCycles := a.commandSlotFullStallCycles + b.commandSlotFullStallCycles
+    sum.pendingFullStallCycles := a.pendingFullStallCycles + b.pendingFullStallCycles
+    sum.tlbStallCycles := a.tlbStallCycles + b.tlbStallCycles
+    sum.sharedStallCycles := a.sharedStallCycles + b.sharedStallCycles
+    sum.cacheReqStallCycles := a.cacheReqStallCycles + b.cacheReqStallCycles
+    sum.g2sLineCount := a.g2sLineCount + b.g2sLineCount
+    sum.s2gLineCount := a.s2gLineCount + b.s2gLineCount
+    sum.g2sCompletionCount := a.g2sCompletionCount + b.g2sCompletionCount
+    sum.s2gCompletionCount := a.s2gCompletionCount + b.s2gCompletionCount
+    sum.g2sCacheResponseCount := a.g2sCacheResponseCount + b.g2sCacheResponseCount
+    sum.s2gCacheResponseCount := a.s2gCacheResponseCount + b.s2gCacheResponseCount
+    sum.g2sCacheLatencySum := a.g2sCacheLatencySum + b.g2sCacheLatencySum
+    sum.s2gCacheLatencySum := a.s2gCacheLatencySum + b.s2gCacheLatencySum
+    sum.activeCommandCycles := a.activeCommandCycles + b.activeCommandCycles
+    sum.activeLineCycles := a.activeLineCycles + b.activeLineCycles
+    sum.sharedActiveLineCycles :=
+      a.sharedActiveLineCycles + b.sharedActiveLineCycles
+    sum.requestActiveLineCycles :=
+      a.requestActiveLineCycles + b.requestActiveLineCycles
+    sum.windowIssued := a.windowIssued + b.windowIssued
+    sum.windowRetired := a.windowRetired + b.windowRetired
+    sum.uniqueLineWaves := a.uniqueLineWaves + b.uniqueLineWaves
+    sum.translationHits := a.translationHits + b.translationHits
+    sum.translationMisses := a.translationMisses + b.translationMisses
+    sum.translationCoalesces := a.translationCoalesces + b.translationCoalesces
+    sum.windowRobFullCycles := a.windowRobFullCycles + b.windowRobFullCycles
+    sum.globalRequestFullCycles :=
+      a.globalRequestFullCycles + b.globalRequestFullCycles
+    sum.sharedQueueFullCycles :=
+      a.sharedQueueFullCycles + b.sharedQueueFullCycles
+    sum.cacheToSharedLatencyCount :=
+      a.cacheToSharedLatencyCount + b.cacheToSharedLatencyCount
+    sum.cacheToSharedLatencySum :=
+      a.cacheToSharedLatencySum + b.cacheToSharedLatencySum
+    sum.descriptorDemandHits :=
+      a.descriptorDemandHits + b.descriptorDemandHits
+    sum.descriptorDemandMisses :=
+      a.descriptorDemandMisses + b.descriptorDemandMisses
+    sum.descriptorPrefetchHits :=
+      a.descriptorPrefetchHits + b.descriptorPrefetchHits
+    sum.descriptorPrefetchMisses :=
+      a.descriptorPrefetchMisses + b.descriptorPrefetchMisses
+    sum.descriptorEvictions :=
+      a.descriptorEvictions + b.descriptorEvictions
+    sum.descriptorCompiles := a.descriptorCompiles + b.descriptorCompiles
+    sum.descriptorCoalesces :=
+      a.descriptorCoalesces + b.descriptorCoalesces
+    sum.descriptorInvalidateKills :=
+      a.descriptorInvalidateKills + b.descriptorInvalidateKills
+    sum.descriptorCompileCycles :=
+      a.descriptorCompileCycles + b.descriptorCompileCycles
+    sum.bindCycles := a.bindCycles + b.bindCycles
+    sum.plannerProduced := a.plannerProduced + b.plannerProduced
+    sum.plannerFire := a.plannerFire + b.plannerFire
+    sum.plannerStallCycles :=
+      a.plannerStallCycles + b.plannerStallCycles
+    sum.maxActiveWindows := Mux(
+      a.maxActiveWindows > b.maxActiveWindows,
+      a.maxActiveWindows, b.maxActiveWindows)
+    sum.maxActiveRequests := Mux(
+      a.maxActiveRequests > b.maxActiveRequests,
+      a.maxActiveRequests, b.maxActiveRequests)
+    sum.maxActiveShared := Mux(
+      a.maxActiveShared > b.maxActiveShared,
+      a.maxActiveShared, b.maxActiveShared)
+    sum.maxActiveWriteAcks :=
+      Mux(a.maxActiveWriteAcks > b.maxActiveWriteAcks,
+        a.maxActiveWriteAcks, b.maxActiveWriteAcks)
+    sum.longestWindowFireRun :=
+      Mux(a.longestWindowFireRun > b.longestWindowFireRun,
+        a.longestWindowFireRun, b.longestWindowFireRun)
     sum
   }
 
@@ -267,25 +366,82 @@ class GPGPU_top_nocache() extends Module {
   val pmuFrontendStall = sumPipelinePerfCounter(_.frontendStallCycles)
   val pmuLsuBackpressure = sumPipelinePerfCounter(_.lsuBackpressureCycles)
   val pmuIbufferFullCycles = sumPipelinePerfCounter(_.ibufferFullCycles)
-  val pmuDmaFenceWaitStall = sumPipelinePerfCounter(_.dmaFenceWaitStallCycles)
+  val pmuTmaWaitStall = sumPipelinePerfCounter(_.tmaWaitStallCycles)
   val pmuComputeIssued = sumInstClassPerfCounter(_.computeIssued)
   val pmuMemIssued = sumInstClassPerfCounter(_.memIssued)
   val pmuCtrlIssued = sumInstClassPerfCounter(_.ctrlIssued)
   val pmuTotalIssued = pmuTotalScalarIssued + pmuTotalVectorIssued
-  val pmuS2G = Wire(new S2GPerfCounters)
-  pmuS2G.instIssued := sumS2GPerfCounter(_.instIssued)
-  pmuS2G.lineIssued := sumS2GPerfCounter(_.lineIssued)
-  pmuS2G.putFull := sumS2GPerfCounter(_.putFull)
-  pmuS2G.putPart := sumS2GPerfCounter(_.putPart)
-  pmuS2G.bytesWritten := sumS2GPerfCounter(_.bytesWritten)
-  pmuS2G.sharedReadReq := sumS2GPerfCounter(_.sharedReadReq)
-  pmuS2G.sharedReadRsp := sumS2GPerfCounter(_.sharedReadRsp)
-  pmuS2G.tlbReq := sumS2GPerfCounter(_.tlbReq)
-  pmuS2G.ackCount := sumS2GPerfCounter(_.ackCount)
-  pmuS2G.ackLatencySum := sumS2GPerfCounter(_.ackLatencySum)
-  pmuS2G.lineFullStallCycles := sumS2GPerfCounter(_.lineFullStallCycles)
-  pmuS2G.readEntryFullStallCycles := sumS2GPerfCounter(_.readEntryFullStallCycles)
-  pmuS2G.ackTagFullStallCycles := sumS2GPerfCounter(_.ackTagFullStallCycles)
+  val pmuTma = Wire(new TmaPerfCounters)
+  pmuTma.instIssued := sumTmaPerfCounter(_.instIssued)
+  pmuTma.lineIssued := sumTmaPerfCounter(_.lineIssued)
+  pmuTma.putFull := sumTmaPerfCounter(_.putFull)
+  pmuTma.putPart := sumTmaPerfCounter(_.putPart)
+  pmuTma.bytesWritten := sumTmaPerfCounter(_.bytesWritten)
+  pmuTma.sharedReadReq := sumTmaPerfCounter(_.sharedReadReq)
+  pmuTma.sharedReadRsp := sumTmaPerfCounter(_.sharedReadRsp)
+  pmuTma.tlbReq := sumTmaPerfCounter(_.tlbReq)
+  pmuTma.lineFullStallCycles := sumTmaPerfCounter(_.lineFullStallCycles)
+  pmuTma.ackTagFullStallCycles := sumTmaPerfCounter(_.ackTagFullStallCycles)
+  pmuTma.commandSlotFullStallCycles := sumTmaPerfCounter(_.commandSlotFullStallCycles)
+  pmuTma.pendingFullStallCycles := sumTmaPerfCounter(_.pendingFullStallCycles)
+  pmuTma.tlbStallCycles := sumTmaPerfCounter(_.tlbStallCycles)
+  pmuTma.sharedStallCycles := sumTmaPerfCounter(_.sharedStallCycles)
+  pmuTma.cacheReqStallCycles := sumTmaPerfCounter(_.cacheReqStallCycles)
+  pmuTma.g2sLineCount := sumTmaPerfCounter(_.g2sLineCount)
+  pmuTma.s2gLineCount := sumTmaPerfCounter(_.s2gLineCount)
+  pmuTma.g2sCompletionCount := sumTmaPerfCounter(_.g2sCompletionCount)
+  pmuTma.s2gCompletionCount := sumTmaPerfCounter(_.s2gCompletionCount)
+  pmuTma.g2sCacheResponseCount := sumTmaPerfCounter(_.g2sCacheResponseCount)
+  pmuTma.s2gCacheResponseCount := sumTmaPerfCounter(_.s2gCacheResponseCount)
+  pmuTma.g2sCacheLatencySum := sumTmaPerfCounter(_.g2sCacheLatencySum)
+  pmuTma.s2gCacheLatencySum := sumTmaPerfCounter(_.s2gCacheLatencySum)
+  pmuTma.activeCommandCycles := sumTmaPerfCounter(_.activeCommandCycles)
+  pmuTma.activeLineCycles := sumTmaPerfCounter(_.activeLineCycles)
+  pmuTma.sharedActiveLineCycles :=
+    sumTmaPerfCounter(_.sharedActiveLineCycles)
+  pmuTma.requestActiveLineCycles :=
+    sumTmaPerfCounter(_.requestActiveLineCycles)
+  pmuTma.windowIssued := sumTmaPerfCounter(_.windowIssued)
+  pmuTma.windowRetired := sumTmaPerfCounter(_.windowRetired)
+  pmuTma.uniqueLineWaves := sumTmaPerfCounter(_.uniqueLineWaves)
+  pmuTma.translationHits := sumTmaPerfCounter(_.translationHits)
+  pmuTma.translationMisses := sumTmaPerfCounter(_.translationMisses)
+  pmuTma.translationCoalesces := sumTmaPerfCounter(_.translationCoalesces)
+  pmuTma.windowRobFullCycles := sumTmaPerfCounter(_.windowRobFullCycles)
+  pmuTma.globalRequestFullCycles :=
+    sumTmaPerfCounter(_.globalRequestFullCycles)
+  pmuTma.sharedQueueFullCycles :=
+    sumTmaPerfCounter(_.sharedQueueFullCycles)
+  pmuTma.cacheToSharedLatencyCount :=
+    sumTmaPerfCounter(_.cacheToSharedLatencyCount)
+  pmuTma.cacheToSharedLatencySum :=
+    sumTmaPerfCounter(_.cacheToSharedLatencySum)
+  pmuTma.descriptorDemandHits :=
+    sumTmaPerfCounter(_.descriptorDemandHits)
+  pmuTma.descriptorDemandMisses :=
+    sumTmaPerfCounter(_.descriptorDemandMisses)
+  pmuTma.descriptorPrefetchHits :=
+    sumTmaPerfCounter(_.descriptorPrefetchHits)
+  pmuTma.descriptorPrefetchMisses :=
+    sumTmaPerfCounter(_.descriptorPrefetchMisses)
+  pmuTma.descriptorEvictions :=
+    sumTmaPerfCounter(_.descriptorEvictions)
+  pmuTma.descriptorCompiles := sumTmaPerfCounter(_.descriptorCompiles)
+  pmuTma.descriptorCoalesces := sumTmaPerfCounter(_.descriptorCoalesces)
+  pmuTma.descriptorInvalidateKills :=
+    sumTmaPerfCounter(_.descriptorInvalidateKills)
+  pmuTma.descriptorCompileCycles :=
+    sumTmaPerfCounter(_.descriptorCompileCycles)
+  pmuTma.bindCycles := sumTmaPerfCounter(_.bindCycles)
+  pmuTma.plannerProduced := sumTmaPerfCounter(_.plannerProduced)
+  pmuTma.plannerFire := sumTmaPerfCounter(_.plannerFire)
+  pmuTma.plannerStallCycles := sumTmaPerfCounter(_.plannerStallCycles)
+  pmuTma.maxActiveWindows := maxTmaPerfCounter(_.maxActiveWindows)
+  pmuTma.maxActiveRequests := maxTmaPerfCounter(_.maxActiveRequests)
+  pmuTma.maxActiveShared := maxTmaPerfCounter(_.maxActiveShared)
+  pmuTma.maxActiveWriteAcks := maxTmaPerfCounter(_.maxActiveWriteAcks)
+  pmuTma.longestWindowFireRun :=
+    maxTmaPerfCounter(_.longestWindowFireRun)
 
   val perfWindowStarted = RegInit(false.B)
   val perfWindowPrinted = RegInit(false.B)
@@ -302,11 +458,11 @@ class GPGPU_top_nocache() extends Module {
   val totalFrontendStall = RegInit(0.U(64.W))
   val totalLsuBackpressure = RegInit(0.U(64.W))
   val totalIbufferFullCycles = RegInit(0.U(64.W))
-  val totalDmaFenceWaitStall = RegInit(0.U(64.W))
+  val totalTmaWaitStall = RegInit(0.U(64.W))
   val totalComputeIssued = RegInit(0.U(64.W))
   val totalMemIssued = RegInit(0.U(64.W))
   val totalCtrlIssued = RegInit(0.U(64.W))
-  val totalS2G = RegInit(0.U.asTypeOf(new S2GPerfCounters))
+  val totalTma = RegInit(0.U.asTypeOf(new TmaPerfCounters))
   val perfStartPulse = io.host_req.fire && !perfWindowStarted
   val perfDumpPulse = io.perfDump && perfWindowStarted && !perfWindowPrinted
   when(perfStartPulse){
@@ -328,11 +484,11 @@ class GPGPU_top_nocache() extends Module {
     totalFrontendStall := totalFrontendStall + pmuFrontendStall
     totalLsuBackpressure := totalLsuBackpressure + pmuLsuBackpressure
     totalIbufferFullCycles := totalIbufferFullCycles + pmuIbufferFullCycles
-    totalDmaFenceWaitStall := totalDmaFenceWaitStall + pmuDmaFenceWaitStall
+    totalTmaWaitStall := totalTmaWaitStall + pmuTmaWaitStall
     totalComputeIssued := totalComputeIssued + pmuComputeIssued
     totalMemIssued := totalMemIssued + pmuMemIssued
     totalCtrlIssued := totalCtrlIssued + pmuCtrlIssued
-    totalS2G := addS2GPerf(totalS2G, pmuS2G)
+    totalTma := addTmaPerf(totalTma, pmuTma)
   }
 
   for (i <- 0 until num_sm) {
@@ -365,11 +521,11 @@ class GPGPU_top_nocache() extends Module {
   val summaryFrontendStall = includeCurrentWindow(totalFrontendStall, pmuFrontendStall)
   val summaryLsuBackpressure = includeCurrentWindow(totalLsuBackpressure, pmuLsuBackpressure)
   val summaryIbufferFullCycles = includeCurrentWindow(totalIbufferFullCycles, pmuIbufferFullCycles)
-  val summaryDmaFenceWaitStall = includeCurrentWindow(totalDmaFenceWaitStall, pmuDmaFenceWaitStall)
+  val summaryTmaWaitStall = includeCurrentWindow(totalTmaWaitStall, pmuTmaWaitStall)
   val summaryComputeIssued = includeCurrentWindow(totalComputeIssued, pmuComputeIssued)
   val summaryMemIssued = includeCurrentWindow(totalMemIssued, pmuMemIssued)
   val summaryCtrlIssued = includeCurrentWindow(totalCtrlIssued, pmuCtrlIssued)
-  val summaryS2G = addS2GPerf(totalS2G, Mux(perfDumpPulse, pmuS2G, zeroS2GPerf))
+  val summaryTma = addTmaPerf(totalTma, Mux(perfDumpPulse, pmuTma, zeroTmaPerf))
   val summaryTotalIssued = summaryScalarIssued + summaryVectorIssued
   val summaryTotalClassIssued = summaryComputeIssued + summaryMemIssued + summaryCtrlIssued
 
@@ -388,7 +544,7 @@ class GPGPU_top_nocache() extends Module {
       printf(p"[PROGRAM ${programId}] [STALL] frontend stall cycles  : ${pmuFrontendStall}\n")
       printf(p"[PROGRAM ${programId}] [STALL] lsu backpressure cyc   : ${pmuLsuBackpressure}\n")
       printf(p"[PROGRAM ${programId}] [STALL] ibuffer full cycles    : ${pmuIbufferFullCycles}\n")
-      printf(p"[PROGRAM ${programId}] [STALL] dma fence/group wait  : ${pmuDmaFenceWaitStall}\n")
+      printf(p"[PROGRAM ${programId}] [STALL] tma wait  : ${pmuTmaWaitStall}\n")
     }
     if (PMU_INST_CLASS) {
       printf(p"[PROGRAM ${programId}] [INST CLASS] compute issued    : ${pmuComputeIssued}\n")
@@ -396,19 +552,33 @@ class GPGPU_top_nocache() extends Module {
       printf(p"[PROGRAM ${programId}] [INST CLASS] ctrl issued       : ${pmuCtrlIssued}\n")
       printf(p"[PROGRAM ${programId}] [INST CLASS] total class issued: ${pmuComputeIssued + pmuMemIssued + pmuCtrlIssued}\n")
     }
-    if (PMU_DMA_S2G) {
-      printf(p"[PROGRAM ${programId}] [S2G PERF] inst issued        : ${pmuS2G.instIssued}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] line issued        : ${pmuS2G.lineIssued}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] PutFull/PutPart    : ${pmuS2G.putFull}/${pmuS2G.putPart}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] bytes written      : ${pmuS2G.bytesWritten}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] shared req/rsp      : ${pmuS2G.sharedReadReq}/${pmuS2G.sharedReadRsp}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] tlb req            : ${pmuS2G.tlbReq}\n")
-      printf(p"[PROGRAM ${programId}] [S2G PERF] ack count         : ${pmuS2G.ackCount}\n")
-      if (PMU_DMA_S2G_DETAIL) {
-        printf(p"[PROGRAM ${programId}] [S2G PERF] ack latency sum   : ${pmuS2G.ackLatencySum}\n")
-        printf(p"[PROGRAM ${programId}] [S2G PERF] line full stall   : ${pmuS2G.lineFullStallCycles}\n")
-        printf(p"[PROGRAM ${programId}] [S2G PERF] read full stall   : ${pmuS2G.readEntryFullStallCycles}\n")
-        printf(p"[PROGRAM ${programId}] [S2G PERF] ack full stall    : ${pmuS2G.ackTagFullStallCycles}\n")
+    if (PMU_TMA) {
+      printf(p"[PROGRAM ${programId}] [TMA PERF] inst issued        : ${pmuTma.instIssued}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] line issued        : ${pmuTma.lineIssued}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] PutFull/PutPart    : ${pmuTma.putFull}/${pmuTma.putPart}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] bytes written      : ${pmuTma.bytesWritten}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] shared req/rsp      : ${pmuTma.sharedReadReq}/${pmuTma.sharedReadRsp}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] tlb req            : ${pmuTma.tlbReq}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] G2S/S2G lines       : ${pmuTma.g2sLineCount}/${pmuTma.s2gLineCount}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] G2S/S2G completions : ${pmuTma.g2sCompletionCount}/${pmuTma.s2gCompletionCount}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] G2S cache responses : ${pmuTma.g2sCacheResponseCount}\n")
+      printf(p"[PROGRAM ${programId}] [TMA PERF] S2G cache responses : ${pmuTma.s2gCacheResponseCount}\n")
+      if (PMU_TMA_DETAIL) {
+        printf(p"[PROGRAM ${programId}] [TMA PERF] line full stall   : ${pmuTma.lineFullStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] ack full stall    : ${pmuTma.ackTagFullStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] command/pending stall: ${pmuTma.commandSlotFullStallCycles}/${pmuTma.pendingFullStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] TLB/shared/cache stall: ${pmuTma.tlbStallCycles}/${pmuTma.sharedStallCycles}/${pmuTma.cacheReqStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] G2S/S2G cache latency: ${pmuTma.g2sCacheLatencySum}/${pmuTma.s2gCacheLatencySum}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] active command/line cycles: ${pmuTma.activeCommandCycles}/${pmuTma.activeLineCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] active shared/request line cycles: ${pmuTma.sharedActiveLineCycles}/${pmuTma.requestActiveLineCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA WINDOW] issued/retired/line waves: ${pmuTma.windowIssued}/${pmuTma.windowRetired}/${pmuTma.uniqueLineWaves}\n")
+        printf(p"[PROGRAM ${programId}] [TMA WINDOW] translation hit/miss/coalesce: ${pmuTma.translationHits}/${pmuTma.translationMisses}/${pmuTma.translationCoalesces}\n")
+        printf(p"[PROGRAM ${programId}] [TMA WINDOW] full ROB/request/shared: ${pmuTma.windowRobFullCycles}/${pmuTma.globalRequestFullCycles}/${pmuTma.sharedQueueFullCycles}; cache-to-shared count/sum: ${pmuTma.cacheToSharedLatencyCount}/${pmuTma.cacheToSharedLatencySum}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] demand hit/miss; prefetch hit/miss: ${pmuTma.descriptorDemandHits}/${pmuTma.descriptorDemandMisses}; ${pmuTma.descriptorPrefetchHits}/${pmuTma.descriptorPrefetchMisses}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] compile/bind cycles: ${pmuTma.descriptorCompileCycles}/${pmuTma.bindCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] planner produced/fire/stall: ${pmuTma.plannerProduced}/${pmuTma.plannerFire}/${pmuTma.plannerStallCycles}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] max window/request/shared/ack: ${pmuTma.maxActiveWindows}/${pmuTma.maxActiveRequests}/${pmuTma.maxActiveShared}/${pmuTma.maxActiveWriteAcks}\n")
+        printf(p"[PROGRAM ${programId}] [TMA PERF] longest window fire run: ${pmuTma.longestWindowFireRun}\n")
       }
     }
   }
@@ -427,7 +597,7 @@ class GPGPU_top_nocache() extends Module {
       printf(p"[TESTCASE TOTAL] [STALL] frontend stall cycles  : ${summaryFrontendStall}\n")
       printf(p"[TESTCASE TOTAL] [STALL] lsu backpressure cyc   : ${summaryLsuBackpressure}\n")
       printf(p"[TESTCASE TOTAL] [STALL] ibuffer full cycles    : ${summaryIbufferFullCycles}\n")
-      printf(p"[TESTCASE TOTAL] [STALL] dma fence/group wait  : ${summaryDmaFenceWaitStall}\n")
+      printf(p"[TESTCASE TOTAL] [STALL] tma wait  : ${summaryTmaWaitStall}\n")
     }
     if (PMU_INST_CLASS) {
       printf(p"[TESTCASE TOTAL] [INST CLASS] compute issued    : ${summaryComputeIssued}\n")
@@ -435,19 +605,33 @@ class GPGPU_top_nocache() extends Module {
       printf(p"[TESTCASE TOTAL] [INST CLASS] ctrl issued       : ${summaryCtrlIssued}\n")
       printf(p"[TESTCASE TOTAL] [INST CLASS] total class issued: ${summaryTotalClassIssued}\n")
     }
-    if (PMU_DMA_S2G) {
-      printf(p"[TESTCASE TOTAL] [S2G PERF] inst issued        : ${summaryS2G.instIssued}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] line issued        : ${summaryS2G.lineIssued}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] PutFull/PutPart    : ${summaryS2G.putFull}/${summaryS2G.putPart}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] bytes written      : ${summaryS2G.bytesWritten}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] shared req/rsp      : ${summaryS2G.sharedReadReq}/${summaryS2G.sharedReadRsp}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] tlb req            : ${summaryS2G.tlbReq}\n")
-      printf(p"[TESTCASE TOTAL] [S2G PERF] ack count         : ${summaryS2G.ackCount}\n")
-      if (PMU_DMA_S2G_DETAIL) {
-        printf(p"[TESTCASE TOTAL] [S2G PERF] ack latency sum   : ${summaryS2G.ackLatencySum}\n")
-        printf(p"[TESTCASE TOTAL] [S2G PERF] line full stall   : ${summaryS2G.lineFullStallCycles}\n")
-        printf(p"[TESTCASE TOTAL] [S2G PERF] read full stall   : ${summaryS2G.readEntryFullStallCycles}\n")
-        printf(p"[TESTCASE TOTAL] [S2G PERF] ack full stall    : ${summaryS2G.ackTagFullStallCycles}\n")
+    if (PMU_TMA) {
+      printf(p"[TESTCASE TOTAL] [TMA PERF] inst issued        : ${summaryTma.instIssued}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] line issued        : ${summaryTma.lineIssued}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] PutFull/PutPart    : ${summaryTma.putFull}/${summaryTma.putPart}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] bytes written      : ${summaryTma.bytesWritten}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] shared req/rsp      : ${summaryTma.sharedReadReq}/${summaryTma.sharedReadRsp}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] tlb req            : ${summaryTma.tlbReq}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] G2S/S2G lines       : ${summaryTma.g2sLineCount}/${summaryTma.s2gLineCount}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] G2S/S2G completions : ${summaryTma.g2sCompletionCount}/${summaryTma.s2gCompletionCount}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] G2S cache responses : ${summaryTma.g2sCacheResponseCount}\n")
+      printf(p"[TESTCASE TOTAL] [TMA PERF] S2G cache responses : ${summaryTma.s2gCacheResponseCount}\n")
+      if (PMU_TMA_DETAIL) {
+        printf(p"[TESTCASE TOTAL] [TMA PERF] line full stall   : ${summaryTma.lineFullStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] ack full stall    : ${summaryTma.ackTagFullStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] command/pending stall: ${summaryTma.commandSlotFullStallCycles}/${summaryTma.pendingFullStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] TLB/shared/cache stall: ${summaryTma.tlbStallCycles}/${summaryTma.sharedStallCycles}/${summaryTma.cacheReqStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] G2S/S2G cache latency: ${summaryTma.g2sCacheLatencySum}/${summaryTma.s2gCacheLatencySum}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] active command/line cycles: ${summaryTma.activeCommandCycles}/${summaryTma.activeLineCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] active shared/request line cycles: ${summaryTma.sharedActiveLineCycles}/${summaryTma.requestActiveLineCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA WINDOW] issued/retired/line waves: ${summaryTma.windowIssued}/${summaryTma.windowRetired}/${summaryTma.uniqueLineWaves}\n")
+        printf(p"[TESTCASE TOTAL] [TMA WINDOW] translation hit/miss/coalesce: ${summaryTma.translationHits}/${summaryTma.translationMisses}/${summaryTma.translationCoalesces}\n")
+        printf(p"[TESTCASE TOTAL] [TMA WINDOW] full ROB/request/shared: ${summaryTma.windowRobFullCycles}/${summaryTma.globalRequestFullCycles}/${summaryTma.sharedQueueFullCycles}; cache-to-shared count/sum: ${summaryTma.cacheToSharedLatencyCount}/${summaryTma.cacheToSharedLatencySum}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] demand hit/miss; prefetch hit/miss: ${summaryTma.descriptorDemandHits}/${summaryTma.descriptorDemandMisses}; ${summaryTma.descriptorPrefetchHits}/${summaryTma.descriptorPrefetchMisses}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] compile/bind cycles: ${summaryTma.descriptorCompileCycles}/${summaryTma.bindCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] planner produced/fire/stall: ${summaryTma.plannerProduced}/${summaryTma.plannerFire}/${summaryTma.plannerStallCycles}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] max window/request/shared/ack: ${summaryTma.maxActiveWindows}/${summaryTma.maxActiveRequests}/${summaryTma.maxActiveShared}/${summaryTma.maxActiveWriteAcks}\n")
+        printf(p"[TESTCASE TOTAL] [TMA PERF] longest window fire run: ${summaryTma.longestWindowFireRun}\n")
       }
     }
   }

@@ -63,7 +63,6 @@ class CtrlSigs extends Bundle {
   // DMA control signals
   val dma = Bool()
   val funct = UInt(3.W)
-  val copysize = UInt(2.W)
   val dma_group = UInt(log2Ceil(dma_group_entries).W)
   //override def cloneType: CtrlSigs.this.type = new CtrlSigs().asInstanceOf[this.type]
   val asid = if(MMU_ENABLED) Some(UInt(KNL_ASID_WIDTH.W)) else None
@@ -73,6 +72,47 @@ class DmaCompletion extends Bundle {
   val wid = UInt(depth_warp.W)
   val group = UInt(log2Ceil(dma_group_entries).W)
   val is_s2g = Bool()
+  val barrierValid = Bool()
+  val barrierId = UInt(log2Ceil(TmaV2Spec.MbarrierEntries).W)
+  val barrierGeneration = UInt(8.W)
+  val transactionBytes = UInt(32.W)
+}
+
+class DmaIssue extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val isS2G = Bool()
+}
+
+class DmaGroupCommand extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val zimm = UInt(5.W)
+}
+
+class DmaTxReserveRequest extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val bytes = UInt(32.W)
+}
+
+class DmaTxReserveResponse extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val accepted = Bool()
+  val barrierValid = Bool()
+  val barrierId = UInt(log2Ceil(TmaV2Spec.MbarrierEntries).W)
+  val generation = UInt(8.W)
+}
+
+class DmaSyncCommand extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val owner = UInt(log2Ceil(num_block).W)
+  val op = UInt(2.W)
+  val address = UInt(32.W)
+  val value = UInt(32.W)
+}
+
+class DmaStatusUpdate extends Bundle {
+  val wid = UInt(depth_warp.W)
+  val code = UInt(8.W)
+  val detail = UInt(8.W)
 }
 class scoreboardIO extends Bundle{
   val ibuffer_if_ctrl=Input(new CtrlSigs())

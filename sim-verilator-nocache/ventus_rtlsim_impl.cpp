@@ -101,7 +101,7 @@ inline constexpr uint8_t L1D_PARAM_NONCACHE = 0x2;   // 不缓存读出/写入
 inline constexpr uint8_t L1D_PARAM_INVALIDATE = 0x0; // 全局无效化
 inline constexpr uint8_t L1D_PARAM_FLUSH = 0x1;      // 全局冲刷
 inline constexpr uint8_t L1D_PARAM_FENCE = 0x2;      // 等待MSHR清空
-inline constexpr uint8_t L1D_PARAM_ATOMIC_SWAP = 16;
+inline constexpr uint8_t L1D_PARAM_ATOMIC_SWAP = 15;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_ADD = 0;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_XOR = 1;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_OR = 2;
@@ -110,6 +110,33 @@ inline constexpr uint8_t L1D_PARAM_ATOMIC_MIN = 4;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_MAX = 5;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_MINU = 6;
 inline constexpr uint8_t L1D_PARAM_ATOMIC_MAXU = 7;
+
+static uint32_t apply_atomic(uint8_t param, uint32_t old_value, uint32_t operand) {
+    switch (param) {
+    case L1D_PARAM_ATOMIC_SWAP:
+        return operand;
+    case L1D_PARAM_ATOMIC_ADD:
+        return old_value + operand;
+    case L1D_PARAM_ATOMIC_XOR:
+        return old_value ^ operand;
+    case L1D_PARAM_ATOMIC_OR:
+        return old_value | operand;
+    case L1D_PARAM_ATOMIC_AND:
+        return old_value & operand;
+    case L1D_PARAM_ATOMIC_MIN:
+        return static_cast<int32_t>(old_value) < static_cast<int32_t>(operand)
+            ? old_value : operand;
+    case L1D_PARAM_ATOMIC_MAX:
+        return static_cast<int32_t>(old_value) > static_cast<int32_t>(operand)
+            ? old_value : operand;
+    case L1D_PARAM_ATOMIC_MINU:
+        return std::min(old_value, operand);
+    case L1D_PARAM_ATOMIC_MAXU:
+        return std::max(old_value, operand);
+    default:
+        return old_value;
+    }
+}
 
 void dcache_rsp_sm0(Vdut* dut, const std::unique_ptr<dcache_reqrsp_t>& rsp);
 void dcache_rsp_sm1(Vdut* dut, const std::unique_ptr<dcache_reqrsp_t>& rsp);
@@ -396,10 +423,48 @@ const ventus_rtlsim_step_result_t* ventus_rtlsim_t::step() {
                         }
                     }
                 }
+            } else if (req->opcode == L1D_OPCODE_ATOMIC) {
+                const bool supported_param =
+                    req->param == L1D_PARAM_ATOMIC_SWAP ||
+                    req->param <= L1D_PARAM_ATOMIC_MAXU;
+                if (!supported_param) {
+                    SPDLOG_LOGGER_ERROR(
+                        logger, "Unsupported dcache atomic parameter {}", req->param
+                    );
+                    sim_got_error = true;
+                }
+                // The nocache physical-memory endpoint is the serialization
+                // point.  Requests from all SMs are handled in this loop one
+                // at a time; the response is queued only after the 32-bit
+                // read-modify-write has completed.  Return the old value, as
+                // the architectural AMO/LSU response expects.
+                for (int i = 0; supported_param && i < NUM_THREAD; i++) {
+                    if (req->mask[i]) {
+                        paddr_t paddr = paddr_base + (req->blockOffset[i] << 2);
+                        uint32_t old_value = 0;
+                        if (!pmem->read(paddr, &old_value, sizeof(old_value))) {
+                            SPDLOG_LOGGER_ERROR(
+                                logger, "Failed to read atomic operand at address {:#x}", paddr
+                            );
+                            sim_got_error = true;
+                            continue;
+                        }
+                        const uint32_t new_value =
+                            apply_atomic(req->param, old_value, req->data[i]);
+                        if (!pmem->write(paddr, &new_value, sizeof(new_value))) {
+                            SPDLOG_LOGGER_ERROR(
+                                logger, "Failed to write atomic result at address {:#x}", paddr
+                            );
+                            sim_got_error = true;
+                            continue;
+                        }
+                        req->data[i] = old_value;
+                    }
+                }
             } else if (req->opcode == L1D_OPCODE_CACHEOP) {
                 // do nothing as here is no cache
                 req.reset();
-            } else { // TODO: not support atomic and cache flush yet
+            } else {
                 SPDLOG_LOGGER_ERROR(logger, "Unsupported dcache request opcode {}, TODO", req->opcode);
                 sim_got_error = true;
                 assert(0);

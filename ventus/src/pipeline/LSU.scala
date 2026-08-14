@@ -67,6 +67,7 @@ class ShareMemCoreReq_np extends Bundle{
   //val ctrlAddr = new Bundle{
   val instrId = UInt(log2Up(lsu_nMshrEntry).W)
   val isWrite = Bool()//Vec(NLanes, Bool())
+  val isMBarrier = Bool()
   //val tag = UInt(dcache_TagBits.W)
   val setIdx = UInt(log2Ceil(sharedmem_depth).W)
   val perLaneAddr = Vec(num_thread, new ShareMemPerLaneAddr_np)
@@ -230,6 +231,7 @@ class AddrCalculate(val sharedmemory_maxsize: UInt = 4096.U(32.W)) extends Modul
   })
   io.to_shared.bits.data := data_next//Mux(reg_save.ctrl.mem_cmd(0).asBool, VecInit(Seq.fill(num_thread)(0.U(xLen.W))), reg_save.in3)
   io.to_shared.bits.isWrite := reg_save.ctrl.mem_cmd(1)
+  io.to_shared.bits.isMBarrier := false.B
   io.to_shared.valid := state===s_shared
 
   //val vld_toDCache = Reg(Bool())

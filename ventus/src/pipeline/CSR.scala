@@ -48,6 +48,7 @@ object CSR{
   val local_id_x = 0x811.U(12.W)
   val local_id_y = 0x812.U(12.W)
   val local_id_z = 0x813.U(12.W)
+  val dma_status = 0x814.U(12.W)
 
 
 
@@ -112,6 +113,7 @@ class CSRFile extends Module {
     val lsu_pds = Output(UInt(xLen.W))
     val lsu_numw= Output(UInt(xLen.W))
     val lsu_numt= Output(UInt(xLen.W))
+    val dmaStatusUpdate = Flipped(Valid(UInt(16.W)))
   })
 
   // Machine Trap-Vector Base-Address Register (mtvec)
@@ -184,6 +186,7 @@ class CSRFile extends Module {
   val wg_id_z = RegInit(0.U(WG_SIZE_Z_WIDTH.W))
   val csr_print = RegInit(0.U(32.W))
   val rpc=RegInit(0.U(32.W))
+  val dmaStatus = RegInit(0.U(16.W))
 
   val global_id_x = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
   val global_id_y = RegInit(VecInit(Seq.fill(num_thread)(0.U(xLen.W))))
@@ -276,7 +279,8 @@ class CSRFile extends Module {
     BitPat(CSR.wg_id_y)-> wg_id_y,
     BitPat(CSR.wg_id_z)-> wg_id_z,
     BitPat(CSR.csr_print)-> csr_print,
-    BitPat(CSR.rpc)->rpc
+    BitPat(CSR.rpc)->rpc,
+    BitPat(CSR.dma_status)->dmaStatus
   )
 
   val csrFile_v= Seq(
@@ -330,7 +334,12 @@ class CSRFile extends Module {
         mcause := csr_wdata
       } .elsewhen(csr_addr === CSR.mtval) {
         mtval := csr_wdata
+      } .elsewhen(csr_addr === CSR.dma_status && csr_wdata === 0.U) {
+        dmaStatus := 0.U
     }
+  }
+  when(io.dmaStatusUpdate.valid && io.dmaStatusUpdate.bits(7, 0) =/= 0.U && dmaStatus === 0.U) {
+    dmaStatus := io.dmaStatusUpdate.bits
   }
   when(io.CTA2csr.valid){
     //是否应该清除原有的CSR配置？
@@ -347,6 +356,7 @@ class CSRFile extends Module {
     wg_id_y:=io.CTA2csr.bits.CTAdata.dispatch2cu_wgid_y_dispatch
     wg_id_z:=io.CTA2csr.bits.CTAdata.dispatch2cu_wgid_z_dispatch
     wg_id:=io.CTA2csr.bits.CTAdata.dispatch2cu_wg_id
+    dmaStatus := 0.U
     for (i <-0 until num_thread){
       global_id_x(i)      := io.CTA2csr.bits.CTAdata.dispatch2cu_threadIdx_global_x(i)
       global_id_y(i)      := io.CTA2csr.bits.CTAdata.dispatch2cu_threadIdx_global_y(i)
@@ -385,6 +395,7 @@ class CSRexe extends Module {
     val lsu_numw= Output(UInt(xLen.W))
     val lsu_numt= Output(UInt(xLen.W))
     val simt_rpc = Output(UInt(xLen.W))
+    val dmaStatusUpdate = Flipped(Valid(new DmaStatusUpdate))
   })
   val vCSR=VecInit(Seq.fill(num_warp)(Module(new CSRFile).io))
   vCSR.foreach(x=>{
@@ -393,6 +404,8 @@ class CSRexe extends Module {
     x.in1:=io.in.bits.in1
     x.CTA2csr.valid:=false.B
     x.CTA2csr.bits:=io.CTA2csr.bits
+    x.dmaStatusUpdate.valid:=false.B
+    x.dmaStatusUpdate.bits:=0.U
   })
   for(i<-0 until num_warp){
     io.sgpr_base(i):=vCSR(i).sgpr_base
@@ -406,6 +419,9 @@ class CSRexe extends Module {
 
   vCSR(io.in.bits.ctrl.wid).write:=io.in.fire
   vCSR(io.CTA2csr.bits.wid).CTA2csr.valid:=io.CTA2csr.valid
+  vCSR(io.dmaStatusUpdate.bits.wid).dmaStatusUpdate.valid := io.dmaStatusUpdate.valid
+  vCSR(io.dmaStatusUpdate.bits.wid).dmaStatusUpdate.bits :=
+    Cat(io.dmaStatusUpdate.bits.detail, io.dmaStatusUpdate.bits.code)
   val result=Module(new Queue(new WriteScalarCtrl,1,pipe=true))
   val result_v=Module(new Queue(new WriteVecCtrl,1,pipe=true))
   result.io.deq<>io.out

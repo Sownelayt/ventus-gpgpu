@@ -87,7 +87,9 @@ VLIB_OBJ_EXPORT = $(VLIB_SRC_CXX_EXPORT:%.cpp=$(VLIB_DIR_BUILDOBJ)/%.o)
 #=====================================================================
 
 # Verilated model parallelism config
-VLIB_NPROC_CPU = $(shell nproc)
+VLIB_NPROC_LIMIT ?= 32
+VLIB_NPROC_CPU ?= $(call MIN_FUNC, $(shell nproc), $(VLIB_NPROC_LIMIT))
+VLIB_NPROC_VERILATE ?= 1
 VLIB_NPROC_DUT = 8 # Depends on RTL circuit size, just try and find a verilator-allowed largest number
 VLIB_NPROC_SIM = $(call MIN_FUNC, $(VLIB_NPROC_CPU), $(VLIB_NPROC_DUT))
 VLIB_NPROC_TRACE_FST = $(call MIN_FUNC, $(VLIB_NPROC_SIM), 2)
@@ -156,7 +158,8 @@ VLIB_VERILATOR_FLAGS += --threads-dpi none
 ifneq ($(filter 1 yes true on,$(GVM_TRACE)),)
 VLIB_VERILATOR_FLAGS += --trace-threads $(VLIB_NPROC_TRACE_FST)
 endif
-VLIB_VERILATOR_FLAGS += -j $(VLIB_NPROC_CPU)
+VLIB_VERILATOR_FLAGS += --build-jobs $(VLIB_NPROC_CPU)
+VLIB_VERILATOR_FLAGS += --verilate-jobs $(VLIB_NPROC_VERILATE)
 VLIB_VERILATOR_FLAGS += -CFLAGS "$(VLIB_CXXFLAGS)"
 VLIB_VERILATOR_FLAGS += -LDFLAGS "$(VLIB_LDFLAGS)"
 VLIB_VERILATOR_FLAGS += --prefix Vdut -Mdir $(VLIB_DIR_BUILDOBJ)
@@ -169,8 +172,9 @@ default: lib
 
 $(VLIB_SRC_V) parameters.json &: $(VLIB_SRC_SCALA)
 	mkdir -p $(VLIB_SRC_V_DIR)
-	cd .. && ./mill ventus[6.4.0].runMain top.paramToJson
-	cd .. && ./mill ventus[6.4.0].runMain circt.stage.ChiselMain --module top.GPGPU_SimTop --target chirrtl --target-dir sim-verilator/$(VLIB_SRC_V_DIR)/
+	find $(VLIB_SRC_V_DIR) -maxdepth 1 -type f \( -name "*.sv" -o -name "*.fir" -o -name "*.anno.json" \) -delete
+	cd .. && ./mill -i ventus[6.4.0].runMain top.paramToJson
+	cd .. && ./mill -i ventus[6.4.0].runMain circt.stage.ChiselMain --module top.GPGPU_SimTop --target chirrtl --target-dir sim-verilator/$(VLIB_SRC_V_DIR)/
 	cd $(VLIB_SRC_V_DIR)/ && firtool --split-verilog GPGPU_SimTop.fir -o .
 	mv $(VLIB_SRC_V_DIR)/GPGPU_SimTop.sv $(VLIB_SRC_V)
 	find $(VLIB_SRC_V_DIR) -name "*.sv" -type f -exec sed -i '1i\`define PRINTF_COND 1' {} \;
