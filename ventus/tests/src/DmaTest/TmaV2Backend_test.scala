@@ -2281,4 +2281,189 @@ class TmaV2Backend_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
+  "eight-entry compiled descriptor store retains eight independent TensorMaps" in {
+    test(new TmaV2DescriptorPerfHarness(entries = 8))
+        .withAnnotations(Seq(CachingAnnotation)) { dut =>
+      dut.io.invalidateAll.poke(false.B)
+      dut.io.request.foreach { request =>
+        request.valid.poke(false.B)
+        request.bits.address.poke(0.U)
+        request.bits.asid.poke(0.U)
+        request.bits.wantResponse.poke(false.B)
+        request.bits.invalidate.poke(false.B)
+      }
+      dut.io.response.foreach(_.ready.poke(false.B))
+      dut.io.memoryRequest.ready.poke(true.B)
+      dut.io.memoryResponse.valid.poke(false.B)
+      dut.io.memoryResponse.bits.words.foreach(_.poke(0.U))
+      dut.clock.step(2)
+
+      def issueDemand(address: Int, expectMiss: Boolean): Unit = {
+        val request = dut.io.request(0)
+        request.bits.address.poke(address.U)
+        request.bits.asid.poke(5.U)
+        request.bits.wantResponse.poke(true.B)
+        request.bits.invalidate.poke(false.B)
+        request.valid.poke(true.B)
+        var waited = 0
+        while (!request.ready.peekBoolean() && waited < 32) {
+          dut.clock.step()
+          waited += 1
+        }
+        assert(waited < 32)
+        dut.io.memoryRequest.valid.expect(expectMiss.B)
+        dut.clock.step()
+        request.valid.poke(false.B)
+      }
+
+      def refill(base: Int): Unit = {
+        dut.io.memoryResponse.bits.words.foreach(_.poke(0.U))
+        dut.io.memoryResponse.bits.words(0).poke(TmaV2Spec.DescriptorMagic.U)
+        dut.io.memoryResponse.bits.words(1).poke(
+          (TmaV2Spec.DTypeU8 | (1 << 5)).U)
+        dut.io.memoryResponse.bits.words(2).poke(base.U)
+        dut.io.memoryResponse.bits.words(4).poke(16.U)
+        dut.io.memoryResponse.bits.words(17).poke(16.U)
+        dut.io.memoryResponse.bits.words(22).poke(1.U)
+        dut.io.memoryResponse.valid.poke(true.B)
+        var waited = 0
+        while (!dut.io.memoryResponse.ready.peekBoolean() && waited < 32) {
+          dut.clock.step()
+          waited += 1
+        }
+        assert(waited < 32)
+        dut.clock.step()
+        dut.io.memoryResponse.valid.poke(false.B)
+      }
+
+      def consume(): Unit = {
+        var waited = 0
+        while (!dut.io.response(0).valid.peekBoolean() && waited < 64) {
+          dut.clock.step()
+          waited += 1
+        }
+        assert(waited < 64)
+        dut.io.response(0).bits.compiled.status.expect(TmaV2Status.Ok)
+        dut.io.response(0).ready.poke(true.B)
+        dut.clock.step()
+        dut.io.response(0).ready.poke(false.B)
+      }
+
+      for (entry <- 0 until 8) {
+        issueDemand(0x1000 + entry * TmaV2Spec.DescriptorAlignment,
+          expectMiss = true)
+        refill(0x10000 + entry * 0x1000)
+        consume()
+      }
+      dut.io.demandMissCount.expect(8.U)
+      dut.io.evictionCount.expect(0.U)
+
+      for (entry <- 0 until 8) {
+        issueDemand(0x1000 + entry * TmaV2Spec.DescriptorAlignment,
+          expectMiss = false)
+        consume()
+      }
+      dut.io.demandHitCount.expect(8.U)
+      dut.io.evictionCount.expect(0.U)
+    }
+  }
+
+  "MMU-on kill drains an accepted payload TLB request without issuing cache traffic" in {
+    test(new TmaV2WindowEngine(
+      windowEntries = 2, requestEntries = 2, sharedEntries = 2,
+      writeAckEntries = 2, mmuEnabled = true))
+        .withAnnotations(Seq(CachingAnnotation)) { dut =>
+      dut.io.command.valid.poke(false.B)
+      dut.io.window.valid.poke(false.B)
+      dut.io.seal.valid.poke(false.B)
+      dut.io.tlbRequest.ready.poke(true.B)
+      dut.io.tlbResponse.valid.poke(false.B)
+      dut.io.sharedRequest.ready.poke(true.B)
+      dut.io.sharedResponse.valid.poke(false.B)
+      dut.io.cacheRequest.ready.poke(true.B)
+      dut.io.cacheResponse.valid.poke(false.B)
+      dut.io.completion.ready.poke(true.B)
+      dut.io.kill.valid.poke(false.B)
+      dut.io.kill.bits.asid.poke(0.U)
+      dut.io.killAsid.poke(0.U)
+      dut.clock.step(2)
+
+      dut.io.command.bits.wid.poke(2.U)
+      dut.io.command.bits.copyDirection.poke(TmaV2Spec.DirectionG2S.U)
+      dut.io.command.bits.dtype.poke(TmaV2Spec.DTypeU8.U)
+      dut.io.command.bits.oobFill.poke(false.B)
+      dut.io.command.bits.reduceMode.poke(TmaV2Spec.ReduceCopy.U)
+      dut.io.command.bits.asid.poke(7.U)
+      dut.io.command.bits.group.poke(0.U)
+      dut.io.command.bits.barrierValid.poke(false.B)
+      dut.io.command.bits.barrierId.poke(0.U)
+      dut.io.command.bits.barrierGeneration.poke(0.U)
+      dut.io.command.bits.transactionBytes.poke(16.U)
+      dut.io.command.valid.poke(true.B)
+      while (!dut.io.command.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.command.valid.poke(false.B)
+
+      dut.io.window.bits.last.poke(true.B)
+      dut.io.window.bits.sharedBase.poke(0x2000.U)
+      for (lane <- 0 until 8) {
+        dut.io.window.bits.lanes(lane).valid.poke((lane == 0).B)
+        dut.io.window.bits.lanes(lane).globalAddress
+          .poke((0x10000 + lane * 16).U)
+        dut.io.window.bits.lanes(lane).globalBytes
+          .poke((if (lane == 0) 16 else 0).U)
+        dut.io.window.bits.lanes(lane).sharedAtomDelta.poke(lane.U)
+        dut.io.window.bits.lanes(lane).sharedBytes
+          .poke((if (lane == 0) 16 else 0).U)
+      }
+      dut.io.window.valid.poke(true.B)
+      while (!dut.io.window.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.window.valid.poke(false.B)
+
+      var waited = 0
+      while (!dut.io.tlbRequest.valid.peekBoolean() && waited < 40) {
+        dut.clock.step()
+        waited += 1
+      }
+      assert(waited < 40, "payload TLB request was not issued")
+      val tlbSource = dut.io.tlbRequest.bits.source.peekInt()
+      dut.clock.step() // TLB request fires.
+
+      dut.io.kill.bits.asid.poke(7.U)
+      dut.io.killAsid.poke(7.U)
+      dut.io.kill.valid.poke(true.B)
+      dut.clock.step()
+      dut.io.kill.valid.poke(false.B)
+      dut.io.killPending.expect(true.B)
+      for (_ <- 0 until 3) {
+        dut.io.completion.valid.expect(false.B)
+        dut.io.tlbRequest.valid.expect(false.B)
+        dut.io.cacheRequest.valid.expect(false.B)
+        dut.io.sharedRequest.valid.expect(false.B)
+        dut.clock.step()
+      }
+
+      dut.io.tlbResponse.bits.source.poke(tlbSource.U)
+      dut.io.tlbResponse.bits.physicalAddress.poke(0x40010000L.U)
+      dut.io.tlbResponse.valid.poke(true.B)
+      dut.io.tlbResponse.ready.expect(true.B)
+      dut.clock.step()
+      dut.io.tlbResponse.valid.poke(false.B)
+
+      waited = 0
+      while (!dut.io.completion.valid.peekBoolean() && waited < 40) {
+        dut.io.tlbRequest.valid.expect(false.B)
+        dut.io.cacheRequest.valid.expect(false.B)
+        dut.io.sharedRequest.valid.expect(false.B)
+        dut.clock.step()
+        waited += 1
+      }
+      assert(waited < 40, "killed command did not retire after TLB drain")
+      dut.io.completion.bits.wid.expect(2.U)
+      dut.clock.step()
+      dut.io.killPending.expect(false.B)
+    }
+  }
+
 }

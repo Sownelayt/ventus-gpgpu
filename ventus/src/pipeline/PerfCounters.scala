@@ -98,4 +98,16 @@ class TmaPerfCounters extends Bundle {
   val maxActiveShared = UInt(64.W)
   val maxActiveWriteAcks = UInt(64.W)
   val longestWindowFireRun = UInt(64.W)
+
+  // Three-stage queue/control and TMA-local cancellation diagnostics.
+  val maxCommandQueueOccupancy = UInt(64.W)
+  val commandQueueFullCycles = UInt(64.W)
+  val prepareBusyCycles = UInt(64.W)
+  val preparedExecuteStallCycles = UInt(64.W)
+  val descriptorAddressInvalidates = UInt(64.W)
+  val descriptorAllInvalidates = UInt(64.W)
+  val queuedKills = UInt(64.W)
+  val preparedKills = UInt(64.W)
+  val activeKills = UInt(64.W)
+  val killDrainCycles = UInt(64.W)
 }

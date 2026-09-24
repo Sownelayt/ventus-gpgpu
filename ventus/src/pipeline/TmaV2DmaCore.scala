@@ -27,6 +27,8 @@ class DmaCoreIO(implicit p: Parameters) extends Bundle {
   val to_l2TLB = Decoupled(new L1TlbReq(SV32))
   val from_l2TLB = Flipped(Decoupled(new L1TlbRsp(SV32)))
   val status = Valid(new DmaStatusUpdate)
+  val killReq = Flipped(Decoupled(new TmaV2KillRequest))
+  val killDone = Valid(new TmaV2KillRequest)
   val perfEnable = Input(Bool())
   val perfReset = Input(Bool())
   val perf_tma = if (PMU_TMA) Some(Output(new TmaPerfCounters)) else None
@@ -83,19 +85,26 @@ class TmaV2PreparedTensor extends Bundle {
   * performs validation, descriptor lookup, binding and transaction reserve.
   * The lookahead never allocates a window or emits a payload request.
   */
-class TmaV2Ingress extends Module {
+class TmaV2Ingress(
+    commandEntries: Int = TmaV2Spec.DefaultCommandQueueEntries) extends Module {
   val io = IO(new Bundle {
     val in = Flipped(Decoupled(new vExeData))
     val descriptorRequest = Vec(2, Decoupled(new TmaV2DescriptorRequest))
     val descriptorResponse =
       Flipped(Vec(2, Decoupled(new TmaV2DescriptorResponse)))
-    val command = Decoupled(new TmaV2EngineCommand)
+    val prepared = Decoupled(new TmaV2PreparedCommand)
     val txReserve = Decoupled(new DmaTxReserveRequest)
+    // A reserve request which reached the external Decoupled boundary and
+    // stalled is irrevocable.  The parent records that presentation so a
+    // same-ASID kill cannot retract valid before the eventual handshake.
+    val txReserveHeld = Input(Bool())
     val txReserveResponse = Flipped(Decoupled(new DmaTxReserveResponse))
-    val window = Decoupled(new TmaV2Window)
-    val seal = Decoupled(Bool())
-    val engineCompletion = Flipped(Valid(new TmaV2EngineCompletion))
     val directCompletion = Decoupled(new DmaCompletion)
+    val descriptorInvalidateAll = Output(Bool())
+    val kill = Flipped(Valid(new TmaV2KillRequest))
+    val killActive = Input(Bool())
+    val killAsid = Input(UInt(SV32.asidLen.W))
+    val killPending = Output(Bool())
     val status = Valid(new DmaStatusUpdate)
     val commandSlotFullStall = Output(Bool())
     val pendingFullStall = Output(Bool())
@@ -103,52 +112,51 @@ class TmaV2Ingress extends Module {
     val plannerProduced = Output(Bool())
     val plannerFire = Output(Bool())
     val plannerStalled = Output(Bool())
+    val commandQueueOccupancy = Output(UInt(
+      log2Ceil(commandEntries + 1).W))
+    val commandQueueFull = Output(Bool())
+    val prepareBusy = Output(Bool())
+    val preparedStall = Output(Bool())
+    val descriptorAddressInvalidate = Output(Bool())
+    val descriptorAllInvalidate = Output(Bool())
+    val queuedKill = Output(Bool())
+    val preparedKill = Output(Bool())
   })
 
   val Seq(sIdle, sValidate, sBulkReserve, sBulkReserveWait, sBulkReady,
     sDescReq, sDescWait, sTensorSetup, sTensorBindWait, sTensorReserve,
     sTensorReserveWait, sTensorReady, sTensorPlanner, sErrorReady,
-    sSeal) = Enum(15)
+    sSeal, sInvalidateReq, sInvalidateWait, sInvalidateAll,
+    sDirectReady) = Enum(19)
   val Seq(cIdle, cPrefetchReq, cInvalidateReq, cInvalidateWait,
     cComplete) = Enum(5)
   val state = RegInit(sIdle)
   val controlState = RegInit(cIdle)
   val controlSaved = Reg(new TmaV2ControlRequest)
+  val controlKilled = RegInit(false.B)
   // Raw coordinates/direction/shared base remain in saved and are reused
   // after binding. Only newly derived fields occupy prepared storage.
   val boundCommand = Reg(new TmaV2PreparedTensor)
 
-  val engineActive = RegInit(false.B)
-  val bulkEmitActive = RegInit(false.B)
-  val tensorEmitActive = RegInit(false.B)
-  // The lookahead must never overwrite the cursor of a stalled active bulk
-  // transfer. Keep a compact prepared snapshot and copy it only at promotion.
+  // The single Prepare slot owns the raw command after it leaves Stage 1.
+  val saved = Reg(new TmaV2CompactRequest)
   val preparedBulkGlobal = Reg(UInt(32.W))
   val preparedBulkShared = Reg(UInt(32.W))
   val preparedBulkWindows = Reg(UInt(26.W))
   val preparedBulkFirstChunk = Reg(UInt(8.W))
   val preparedBulkLastChunk = Reg(UInt(8.W))
-  val bulkGlobal = Reg(UInt(32.W))
-  val bulkShared = Reg(UInt(32.W))
-  val bulkWindowsRemaining = Reg(UInt(26.W))
-  val bulkFirst = RegInit(false.B)
-  val bulkFirstChunk = Reg(UInt(8.W))
-  val bulkLastChunk = Reg(UInt(8.W))
-
   val reserveAccepted = RegInit(false.B)
   val reserveBarrierValid = RegInit(false.B)
   val reserveBarrierId =
     Reg(UInt(log2Ceil(TmaV2Spec.MbarrierEntries).W))
   val reserveGeneration = Reg(UInt(8.W))
   val preparedTransactionBytes = Reg(UInt(32.W))
-
-  when(io.engineCompletion.valid) {
-    assert(engineActive)
-    engineActive := false.B
-  }
+  val prepareKilled = RegInit(false.B)
 
   val incomingTensorMapControl =
-    io.in.bits.ctrl.funct === TmaV2Spec.FunctPrefetchTensormap.U
+    io.in.bits.ctrl.funct === TmaV2Spec.FunctPrefetchTensormap.U &&
+      io.in.bits.ctrl.inst(31, 27) ===
+        TmaV2Spec.TensorMapPrefetchSubop.U
   val compactInput =
     WireDefault(0.U.asTypeOf(new TmaV2CompactRequest))
   compactInput.funct := io.in.bits.ctrl.funct
@@ -165,42 +173,49 @@ class TmaV2Ingress extends Module {
       io.in.bits.ctrl.funct === TmaV2Spec.FunctTensorS2G.U,
     TmaV2Spec.DirectionS2G.U, TmaV2Spec.DirectionG2S.U)
   compactInput.opBits := io.in.bits.ctrl.inst(31, 27)
+  val incomingPrefetchKilled = incomingTensorMapControl &&
+    ((io.killActive && compactInput.asid === io.killAsid) ||
+      (io.kill.valid && compactInput.asid === io.kill.bits.asid))
   // Control hints remain independent of both the active command and the
   // single data lookahead.
   val controlRequestQ =
     Module(new Queue(new TmaV2ControlRequest, 1, pipe = true))
   controlRequestQ.io.enq.valid :=
-    io.in.valid && incomingTensorMapControl
+    io.in.valid && incomingTensorMapControl && !incomingPrefetchKilled
   controlRequestQ.io.enq.bits.address := compactInput.in1
   controlRequestQ.io.enq.bits.asid := compactInput.asid
   controlRequestQ.io.enq.bits.wid := compactInput.wid
   controlRequestQ.io.enq.bits.subop := compactInput.opBits
-  // This queue is the sole LookaheadSlot. Its head remains stable through
-  // validation, descriptor lookup, binding and reservation; no second raw
-  // request register exists. `pipe` permits promotion and refill on one edge.
-  val dataRequestQ =
-    Module(new Queue(new TmaV2CompactRequest, 1, pipe = true, flow = false))
+  val dataRequestQ = Module(new TmaV2CommandQueue(commandEntries))
   dataRequestQ.io.enq.valid :=
-    io.in.valid && !incomingTensorMapControl
+    io.in.valid && (!incomingTensorMapControl || incomingPrefetchKilled)
   dataRequestQ.io.enq.bits := compactInput
-  val saved = dataRequestQ.io.deq.bits
+  dataRequestQ.io.kill := io.kill
+  dataRequestQ.io.killActive := io.killActive
+  dataRequestQ.io.killAsid := io.killAsid
   val savedReduceMode = Mux(
     saved.funct === TmaV2Spec.FunctBulkS2G.U ||
       saved.funct === TmaV2Spec.FunctTensorS2G.U,
     saved.opBits(4, 2), TmaV2Spec.ReduceCopy.U)
   val savedBulkReduceType = saved.opBits(1, 0)
-  val popDataRequest = WireDefault(false.B)
-  dataRequestQ.io.deq.ready := popDataRequest
+  dataRequestQ.io.deq.ready := state === sIdle
   io.in.ready := Mux(incomingTensorMapControl,
-    controlRequestQ.io.enq.ready,
+    Mux(incomingPrefetchKilled, dataRequestQ.io.enq.ready,
+      controlRequestQ.io.enq.ready),
     dataRequestQ.io.enq.ready)
   io.commandSlotFullStall :=
     io.in.valid && !incomingTensorMapControl &&
       !dataRequestQ.io.enq.ready
   io.pendingFullStall := io.in.valid && incomingTensorMapControl &&
-    !controlRequestQ.io.enq.ready
+    !incomingPrefetchKilled && !controlRequestQ.io.enq.ready
+  io.commandQueueOccupancy := dataRequestQ.io.occupancy
+  io.commandQueueFull := dataRequestQ.io.full
+  io.prepareBusy := state =/= sIdle
+  io.preparedStall := io.prepared.valid && !io.prepared.ready
 
-  when(state === sIdle && dataRequestQ.io.deq.valid) {
+  when(dataRequestQ.io.deq.fire) {
+    saved := dataRequestQ.io.deq.bits
+    prepareKilled := false.B
     reserveAccepted := false.B
     reserveBarrierValid := false.B
     preparedTransactionBytes := 0.U
@@ -227,33 +242,56 @@ class TmaV2Ingress extends Module {
   val readyCommand =
     state === sBulkReady || state === sTensorReady ||
       state === sErrorReady
-  io.command.valid := readyCommand && !engineActive
-  io.command.bits.wid := saved.wid
-  io.command.bits.copyDirection := saved.copyDirection
+  val prepareKillNow = io.kill.valid && state =/= sIdle &&
+    saved.asid === io.kill.bits.asid
+  val prepareKill = prepareKilled || prepareKillNow
+  io.prepared.valid := readyCommand && !prepareKill
+  io.prepared.bits := 0.U.asTypeOf(new TmaV2PreparedCommand)
+  io.prepared.bits.engine.wid := saved.wid
+  io.prepared.bits.engine.copyDirection := saved.copyDirection
   val bulkReduce = state === sBulkReady &&
     savedReduceMode =/= TmaV2Spec.ReduceCopy.U
-  io.command.bits.dtype := Mux(state === sTensorReady,
+  io.prepared.bits.engine.dtype := Mux(state === sTensorReady,
     boundCommand.compiled.dtype,
     Mux(bulkReduce,
       Mux(savedBulkReduceType === TmaV2Spec.BulkReduceTypeS32.U,
         TmaV2Spec.DTypeS32.U, TmaV2Spec.DTypeU32.U),
       TmaV2Spec.DTypeU8.U))
-  io.command.bits.oobFill := state === sTensorReady &&
+  io.prepared.bits.engine.oobFill := state === sTensorReady &&
     boundCommand.compiled.oobFill
-  io.command.bits.reduceMode := Mux(
+  io.prepared.bits.engine.reduceMode := Mux(
     state === sTensorReady || state === sBulkReady,
     savedReduceMode, TmaV2Spec.ReduceCopy.U)
-  io.command.bits.asid := saved.asid
-  io.command.bits.group := saved.group
-  io.command.bits.barrierValid :=
+  io.prepared.bits.engine.asid := saved.asid
+  io.prepared.bits.engine.group := saved.group
+  io.prepared.bits.engine.barrierValid :=
     reserveAccepted && reserveBarrierValid && state =/= sErrorReady
-  io.command.bits.barrierId := Mux(io.command.bits.barrierValid,
+  io.prepared.bits.engine.barrierId := Mux(io.prepared.bits.engine.barrierValid,
     reserveBarrierId, 0.U)
-  io.command.bits.barrierGeneration := Mux(
-    io.command.bits.barrierValid, reserveGeneration, 0.U)
-  io.command.bits.transactionBytes := Mux(
+  io.prepared.bits.engine.barrierGeneration := Mux(
+    io.prepared.bits.engine.barrierValid, reserveGeneration, 0.U)
+  io.prepared.bits.engine.transactionBytes := Mux(
     reserveAccepted && reserveBarrierValid && state =/= sErrorReady,
     preparedTransactionBytes, 0.U)
+  io.prepared.bits.kind := Mux(state === sBulkReady,
+    TmaV2PreparedKind.Bulk,
+    Mux(state === sTensorReady, TmaV2PreparedKind.Tensor,
+      TmaV2PreparedKind.Empty))
+  io.prepared.bits.bulkGlobal := preparedBulkGlobal
+  io.prepared.bits.bulkShared := preparedBulkShared
+  io.prepared.bits.bulkWindows := preparedBulkWindows
+  io.prepared.bits.bulkFirstChunk := preparedBulkFirstChunk
+  io.prepared.bits.bulkLastChunk := preparedBulkLastChunk
+  io.prepared.bits.tensor.compiled := boundCommand.compiled
+  io.prepared.bits.tensor.copyDirection := saved.copyDirection
+  io.prepared.bits.tensor.sharedBase := saved.in3
+  io.prepared.bits.tensor.reduceMode := savedReduceMode
+  for (dimension <- 0 until TmaV2Spec.RankMax) {
+    io.prepared.bits.tensor.coordinates(dimension) :=
+      saved.in2(dimension).asSInt
+    io.prepared.bits.tensor.originComponents(dimension) :=
+      boundCommand.originComponents(dimension)
+  }
 
   for (client <- 0 until 2) {
     io.descriptorRequest(client).valid := false.B
@@ -263,27 +301,34 @@ class TmaV2Ingress extends Module {
   io.descriptorRequest(0).valid := state === sDescReq
   io.descriptorRequest(0).bits.address := saved.in1
   io.descriptorRequest(0).bits.asid := saved.asid
+  io.descriptorRequest(0).valid :=
+    (state === sDescReq || state === sInvalidateReq) && !prepareKill
   io.descriptorRequest(0).bits.wantResponse := true.B
-  io.descriptorRequest(0).bits.invalidate := false.B
+  io.descriptorRequest(0).bits.invalidate := state === sInvalidateReq
+  val controlKillNow = io.kill.valid &&
+    ((controlState =/= cIdle && controlSaved.asid === io.kill.bits.asid) ||
+      (controlRequestQ.io.deq.valid &&
+        controlRequestQ.io.deq.bits.asid === io.kill.bits.asid))
   io.descriptorRequest(1).valid :=
-    controlState === cPrefetchReq || controlState === cInvalidateReq
+    (controlState === cPrefetchReq || controlState === cInvalidateReq) &&
+      !controlKilled && !controlKillNow
   io.descriptorRequest(1).bits.address := controlSaved.address
   io.descriptorRequest(1).bits.asid := controlSaved.asid
   io.descriptorRequest(1).bits.wantResponse :=
     controlState === cInvalidateReq
   io.descriptorRequest(1).bits.invalidate :=
     controlState === cInvalidateReq
-  io.descriptorResponse(0).ready := state === sDescWait
+  io.descriptorResponse(0).ready :=
+    state === sDescWait || state === sInvalidateWait
   io.descriptorResponse(1).ready := controlState === cInvalidateWait
 
   val binder = Module(new TmaV2CommandBinder)
-  val windowPlanner = Module(new TmaV2WindowPlanner)
   io.bindCycle := binder.io.bindCycle
-  io.plannerProduced := windowPlanner.io.produced
-  io.plannerFire := windowPlanner.io.out.fire
-  io.plannerStalled := windowPlanner.io.stalled
+  io.plannerProduced := false.B
+  io.plannerFire := false.B
+  io.plannerStalled := false.B
 
-  binder.io.in.valid := state === sTensorSetup &&
+  binder.io.in.valid := state === sTensorSetup && !prepareKill &&
     boundCommand.compiled.status === TmaV2Status.Ok
   binder.io.in.bits.compiled := boundCommand.compiled
   binder.io.in.bits.request.copyDirection := saved.copyDirection
@@ -295,80 +340,58 @@ class TmaV2Ingress extends Module {
   }
   binder.io.out.ready := state === sTensorBindWait
 
-  val plannerCommand =
-    WireDefault(0.U.asTypeOf(new TmaV2BoundCommand))
-  plannerCommand.compiled := boundCommand.compiled
-  plannerCommand.copyDirection := saved.copyDirection
-  plannerCommand.sharedBase := saved.in3
-  for (dimension <- 0 until TmaV2Spec.RankMax) {
-    plannerCommand.coordinates(dimension) :=
-      saved.in2(dimension).asSInt
-  }
-  plannerCommand.originComponents := boundCommand.originComponents
-  plannerCommand.reduceMode := savedReduceMode
-  windowPlanner.io.in.valid :=
-    state === sTensorPlanner && !tensorEmitActive
-  windowPlanner.io.in.bits := plannerCommand
-
   val reserveBytes = Mux(
     state === sBulkReserve || state === sBulkReserveWait,
     saved.in2(0), boundCommand.compiled.logicalBytes)
   io.txReserve.valid :=
-    state === sBulkReserve || state === sTensorReserve
+    (state === sBulkReserve || state === sTensorReserve) &&
+      (!prepareKill || io.txReserveHeld)
   io.txReserve.bits.wid := saved.wid
   io.txReserve.bits.bytes := reserveBytes
   io.txReserveResponse.ready :=
     state === sBulkReserveWait || state === sTensorReserveWait
 
-  // Lookahead precomputes count/edge chunks.  The active recurrence is now a
-  // narrow decrement plus a three-way chunk select instead of a 32-bit
-  // compare/subtract feedback path on every emitted window.
-  val bulkChunk = Mux(
-    bulkFirst, bulkFirstChunk,
-    Mux(bulkWindowsRemaining === 1.U,
-      bulkLastChunk, 128.U(8.W)))
-  val bulkChunkWide = bulkChunk.pad(32)
-  val bulkWindow = WireDefault(0.U.asTypeOf(new TmaV2Window))
-  bulkWindow.sharedBase := bulkShared
-  bulkWindow.last := bulkWindowsRemaining === 1.U
-  for (lane <- 0 until 8) {
-    val laneOffset = (lane * 16).U(32.W)
-    val active = laneOffset < bulkChunkWide
-    bulkWindow.lanes(lane).valid := active
-    bulkWindow.lanes(lane).globalAddress := bulkGlobal + laneOffset
-    bulkWindow.lanes(lane).globalBytes := Mux(active, 16.U, 0.U)
-    bulkWindow.lanes(lane).sharedAtomDelta := lane.U
-    bulkWindow.lanes(lane).sharedBytes := Mux(active, 16.U, 0.U)
-  }
+  io.descriptorInvalidateAll := state === sInvalidateAll
+  io.descriptorAddressInvalidate :=
+    io.descriptorRequest(0).fire && state === sInvalidateReq
+  io.descriptorAllInvalidate := state === sInvalidateAll
 
-  io.window.valid := Mux(bulkEmitActive, true.B,
-    tensorEmitActive && windowPlanner.io.out.valid)
-  io.window.bits := Mux(bulkEmitActive, bulkWindow,
-    windowPlanner.io.out.bits)
-  windowPlanner.io.out.ready :=
-    tensorEmitActive && !bulkEmitActive && io.window.ready
-
-  val sealQ = Module(new Queue(Bool(), 1, pipe = true, flow = false))
-  sealQ.io.enq.valid := state === sSeal
-  sealQ.io.enq.bits := true.B
-  io.seal <> sealQ.io.deq
-  popDataRequest :=
-    (state === sBulkReady && io.command.fire) ||
-      (state === sTensorPlanner && windowPlanner.io.in.fire) ||
-      (state === sSeal && sealQ.io.enq.fire)
-
-  io.directCompletion.valid := controlState === cComplete
-  io.directCompletion.bits.wid := controlSaved.wid
-  io.directCompletion.bits.group := 0.U
-  io.directCompletion.bits.is_s2g := false.B
-  io.directCompletion.bits.barrierValid := false.B
-  io.directCompletion.bits.barrierId := 0.U
-  io.directCompletion.bits.barrierGeneration := 0.U
-  io.directCompletion.bits.transactionBytes := 0.U
+  val controlCompletion = Wire(Decoupled(new DmaCompletion))
+  controlCompletion.valid := controlState === cComplete
+  controlCompletion.bits.wid := controlSaved.wid
+  controlCompletion.bits.group := 0.U
+  controlCompletion.bits.is_s2g := false.B
+  controlCompletion.bits.barrierValid := false.B
+  controlCompletion.bits.barrierId := 0.U
+  controlCompletion.bits.barrierGeneration := 0.U
+  controlCompletion.bits.transactionBytes := 0.U
+  val mainDirectCompletion = Wire(Decoupled(new DmaCompletion))
+  mainDirectCompletion.valid := state === sDirectReady
+  mainDirectCompletion.bits.wid := saved.wid
+  mainDirectCompletion.bits.group := saved.group
+  mainDirectCompletion.bits.is_s2g :=
+    saved.copyDirection === TmaV2Spec.DirectionS2G.U
+  mainDirectCompletion.bits.barrierValid :=
+    reserveAccepted && reserveBarrierValid
+  mainDirectCompletion.bits.barrierId :=
+    Mux(mainDirectCompletion.bits.barrierValid, reserveBarrierId, 0.U)
+  mainDirectCompletion.bits.barrierGeneration :=
+    Mux(mainDirectCompletion.bits.barrierValid, reserveGeneration, 0.U)
+  mainDirectCompletion.bits.transactionBytes :=
+    Mux(mainDirectCompletion.bits.barrierValid,
+      preparedTransactionBytes, 0.U)
+  val directArb = Module(new Arbiter(new DmaCompletion, 3))
+  directArb.io.in(0) <> mainDirectCompletion
+  directArb.io.in(1) <> controlCompletion
+  directArb.io.in(2) <> dataRequestQ.io.cancelled
+  io.directCompletion <> directArb.io.out
+  io.queuedKill := dataRequestQ.io.cancelled.fire
+  io.preparedKill := mainDirectCompletion.fire && prepareKilled
 
   controlRequestQ.io.deq.ready := controlState === cIdle
   when(controlRequestQ.io.deq.fire) {
     controlSaved := controlRequestQ.io.deq.bits
+    controlKilled := false.B
     val aligned = controlRequestQ.io.deq.bits.address(6, 0) === 0.U
     val prefetch = controlRequestQ.io.deq.bits.subop ===
       TmaV2Spec.TensorMapPrefetchSubop.U
@@ -390,6 +413,12 @@ class TmaV2Ingress extends Module {
   }
 
   when(state === sValidate) {
+    val tensorMapControl =
+      saved.funct === TmaV2Spec.FunctPrefetchTensormap.U
+    val invalidateAddress = saved.opBits ===
+      TmaV2Spec.TensorMapInvalidateSubop.U
+    val invalidateAll = saved.opBits ===
+      TmaV2Spec.TensorMapInvalidateAllSubop.U
     val bulk = saved.funct === TmaV2Spec.FunctBulkG2S.U ||
       saved.funct === TmaV2Spec.FunctBulkS2G.U
     val tensor = saved.funct === TmaV2Spec.FunctTensorG2S.U ||
@@ -421,7 +450,18 @@ class TmaV2Ingress extends Module {
       sharedAddress(3, 0) =/= 0.U ||
       saved.in2(0) === 0.U || saved.in2(0)(3, 0) =/= 0.U ||
       !bulkReduceEncodingLegal
-    when(bulk && !badBulk) {
+    when(tensorMapControl && invalidateAddress && saved.in1(6, 0) === 0.U) {
+      state := sInvalidateReq
+    }.elsewhen(tensorMapControl && invalidateAll) {
+      state := sInvalidateAll
+    }.elsewhen(tensorMapControl) {
+      state := sDirectReady
+      report(
+        Mux(invalidateAddress,
+          TmaV2Spec.StatusInvalidDescriptor.U,
+          TmaV2Spec.StatusUnsupportedFeature.U),
+        Mux(invalidateAddress, TmaV2Status.BadAlignment, saved.opBits))
+    }.elsewhen(bulk && !badBulk) {
       val sharedPhase = sharedAddress(6, 0)
       val firstCapacity = 128.U(9.W) - sharedPhase
       val firstChunk = Mux(
@@ -460,7 +500,9 @@ class TmaV2Ingress extends Module {
     reserveBarrierValid := io.txReserveResponse.bits.barrierValid
     reserveBarrierId := io.txReserveResponse.bits.barrierId
     reserveGeneration := io.txReserveResponse.bits.generation
-    when(!io.txReserveResponse.bits.accepted) {
+    when(prepareKill) {
+      state := sDirectReady
+    }.elsewhen(!io.txReserveResponse.bits.accepted) {
       state := sErrorReady
     }.otherwise {
       state := Mux(state === sBulkReserveWait,
@@ -468,11 +510,18 @@ class TmaV2Ingress extends Module {
     }
   }
 
-  when(io.descriptorRequest(0).fire) { state := sDescWait }
-  when(io.descriptorResponse(0).fire) {
-    boundCommand.compiled := io.descriptorResponse(0).bits.compiled
-    state := sTensorSetup
+  when(io.descriptorRequest(0).fire) {
+    state := Mux(state === sInvalidateReq, sInvalidateWait, sDescWait)
   }
+  when(io.descriptorResponse(0).fire) {
+    when(prepareKill || state === sInvalidateWait) {
+      state := sDirectReady
+    }.otherwise {
+      boundCommand.compiled := io.descriptorResponse(0).bits.compiled
+      state := sTensorSetup
+    }
+  }
+  when(state === sInvalidateAll) { state := sDirectReady }
   when(state === sTensorSetup) {
     when(boundCommand.compiled.status =/= TmaV2Status.Ok) {
       state := sErrorReady
@@ -490,7 +539,9 @@ class TmaV2Ingress extends Module {
     }
   }
   when(state === sTensorBindWait && binder.io.out.fire) {
-    when(!binder.io.out.bits.legal) {
+    when(prepareKill) {
+      state := sDirectReady
+    }.elsewhen(!binder.io.out.bits.legal) {
       state := sErrorReady
       val unsupported =
         binder.io.out.bits.status === TmaV2Status.UnsupportedDType ||
@@ -513,56 +564,49 @@ class TmaV2Ingress extends Module {
     }
   }
 
-  when(io.command.fire) {
-    engineActive := true.B
-    when(state === sBulkReady) {
-      bulkGlobal := preparedBulkGlobal
-      bulkShared := preparedBulkShared
-      bulkWindowsRemaining := preparedBulkWindows
-      bulkFirst := true.B
-      bulkFirstChunk := preparedBulkFirstChunk
-      bulkLastChunk := preparedBulkLastChunk
-      bulkEmitActive := true.B
-      state := sIdle
-    }.elsewhen(state === sTensorReady) {
-      state := sTensorPlanner
-    }.otherwise {
-      state := sSeal
-    }
-  }
-  when(windowPlanner.io.in.fire) {
-    tensorEmitActive := true.B
+  when(io.prepared.fire) {
     state := sIdle
+    prepareKilled := false.B
   }
-  when(bulkEmitActive && io.window.fire) {
-    bulkGlobal := bulkGlobal + bulkChunkWide
-    bulkShared := bulkShared + bulkChunkWide
-    bulkWindowsRemaining := bulkWindowsRemaining - 1.U
-    bulkFirst := false.B
-    when(bulkWindow.last) { bulkEmitActive := false.B }
+  when(mainDirectCompletion.fire) {
+    state := sIdle
+    prepareKilled := false.B
   }
-  when(tensorEmitActive && io.window.fire && !bulkEmitActive &&
-      io.window.bits.last) {
-    tensorEmitActive := false.B
-  }
-  when(state === sSeal && sealQ.io.enq.fire) { state := sIdle }
 
   when(io.descriptorRequest(1).fire) {
     controlState := Mux(
       controlState === cInvalidateReq, cInvalidateWait, cComplete)
   }
   when(io.descriptorResponse(1).fire) { controlState := cComplete }
-  when(io.directCompletion.fire) { controlState := cIdle }
+  when(controlCompletion.fire) {
+    controlState := cIdle
+    controlKilled := false.B
+  }
+
+  when(controlKillNow) {
+    controlKilled := true.B
+    controlState := cComplete
+  }
+
+  when(prepareKillNow) {
+    prepareKilled := true.B
+    val heldReserve = io.txReserveHeld &&
+      (state === sBulkReserve || state === sTensorReserve)
+    when(state =/= sDescWait && state =/= sInvalidateWait &&
+        state =/= sBulkReserveWait && state =/= sTensorReserveWait &&
+        state =/= sTensorBindWait && !heldReserve) {
+      state := sDirectReady
+    }
+  }
+
+  io.killPending := dataRequestQ.io.matchingPending ||
+    (state =/= sIdle && saved.asid === io.killAsid) ||
+    (controlState =/= cIdle && controlSaved.asid === io.killAsid) ||
+    (controlRequestQ.io.deq.valid &&
+      controlRequestQ.io.deq.bits.asid === io.killAsid)
 
   when(!reset.asBool) {
-    assert(!(bulkEmitActive && tensorEmitActive))
-    assert(!io.window.fire ||
-      PopCount(io.window.bits.lanes.map(_.valid)) > 0.U)
-    assert(!(windowPlanner.io.in.fire && tensorEmitActive))
-    when(state =/= sIdle && engineActive) {
-      assert(!io.window.fire || bulkEmitActive || tensorEmitActive,
-        "lookahead must not emit payload windows")
-    }
+    assert(!io.prepared.fire || readyCommand)
   }
 }
 
@@ -571,7 +615,8 @@ class TmaV2DmaCore(
     requestEntries: Int = TmaV2Spec.DefaultGlobalRequestEntries,
     sharedEntries: Int = TmaV2Spec.DefaultSharedReadyEntries,
     writeAckEntries: Int = TmaV2Spec.DefaultWriteAckEntries,
-    descriptorEntries: Int = TmaV2Spec.DefaultDescriptorEntries)(
+    descriptorEntries: Int = TmaV2Spec.DefaultDescriptorEntries,
+    commandEntries: Int = TmaV2Spec.DefaultCommandQueueEntries)(
     implicit p: Parameters) extends Module {
   require(requestEntries >= 2 && requestEntries <= 256,
     "TMA requestEntries must be in 2..256")
@@ -583,34 +628,68 @@ class TmaV2DmaCore(
   require(l1cache_sourceBits >
     log2Ceil(cacheSourceEntries),
     "descriptor and global-request responses need distinct DMA source IDs")
-  val ingress = Module(new TmaV2Ingress)
+  val ingress = Module(new TmaV2Ingress(commandEntries))
+  val execute = Module(new TmaV2ExecuteStage)
   val subsystem = Module(new TmaV2WindowSubsystem(
     windowEntries = windowEntries,
     requestEntries = requestEntries,
     sharedEntries = sharedEntries,
     writeAckEntries = writeAckEntries,
     descriptorEntries = descriptorEntries))
-  // PMU reset must not evict compiled descriptors.  Global invalidation is
-  // provided by module reset; architectural address-scoped invalidation
-  // travels through descriptor client 1.
-  subsystem.io.descriptorInvalidateAll := false.B
+
+  val killActive = RegInit(false.B)
+  val killAsid = Reg(UInt(SV32.asidLen.W))
+  io.killReq.ready := !killActive
+  val killEvent = Wire(Valid(new TmaV2KillRequest))
+  killEvent.valid := io.killReq.fire
+  killEvent.bits := io.killReq.bits
+  when(io.killReq.fire) {
+    killActive := true.B
+    killAsid := io.killReq.bits.asid
+  }
+  val effectiveKillAsid = Mux(io.killReq.fire, io.killReq.bits.asid, killAsid)
+  ingress.io.kill := killEvent
+  ingress.io.killActive := killActive || io.killReq.fire
+  ingress.io.killAsid := effectiveKillAsid
+  execute.io.kill := killEvent
+  execute.io.killActive := killActive || io.killReq.fire
+  execute.io.killAsid := effectiveKillAsid
+  subsystem.io.kill := killEvent
+  subsystem.io.killAsid := effectiveKillAsid
+  // PMU reset must not evict compiled descriptors. Architectural all-entry
+  // invalidation is ordered through the main Prepare stream.
+  subsystem.io.descriptorInvalidateAll := ingress.io.descriptorInvalidateAll
 
   ingress.io.in <> io.dma_req
   for (client <- 0 until 2) {
     subsystem.io.descriptorRequest(client) <> ingress.io.descriptorRequest(client)
     ingress.io.descriptorResponse(client) <> subsystem.io.descriptorResponse(client)
   }
-  subsystem.io.command <> ingress.io.command
+  execute.io.in <> ingress.io.prepared
+  subsystem.io.command <> execute.io.command
+  val txReserveHeld = RegInit(false.B)
+  ingress.io.txReserveHeld := txReserveHeld
   io.txReserve <> ingress.io.txReserve
+  when(io.txReserve.fire) {
+    txReserveHeld := false.B
+  }.elsewhen(io.txReserve.valid && !io.txReserve.ready) {
+    txReserveHeld := true.B
+  }
   ingress.io.txReserveResponse <> io.txReserveResponse
   // Terminate both the tensor Planner and bulk arithmetic before the Engine
   // allocators.  The one-entry pipe accepts/refills every cycle, so this is a
   // fill-latency change only; it does not insert bubbles into an II=1 stream.
   val windowIngress = Module(new Queue(
     new TmaV2Window, 1, pipe = true, flow = false))
-  windowIngress.io.enq <> ingress.io.window
-  subsystem.io.window <> windowIngress.io.deq
-  subsystem.io.seal <> ingress.io.seal
+  windowIngress.io.enq <> execute.io.window
+  val dropBufferedWindow = killEvent.valid && execute.io.active &&
+    execute.io.activeAsid === killEvent.bits.asid
+  subsystem.io.window.valid :=
+    windowIngress.io.deq.valid && !dropBufferedWindow
+  subsystem.io.window.bits := windowIngress.io.deq.bits
+  windowIngress.io.deq.ready := Mux(
+    dropBufferedWindow, true.B, subsystem.io.window.ready)
+  subsystem.io.seal <> execute.io.seal
   io.status := ingress.io.status
 
   val tlbArb = Module(new Arbiter(new L1TlbReq(SV32), 2))
@@ -751,20 +830,34 @@ class TmaV2DmaCore(
   val descriptorDeferrals = RegInit(0.U(3.W))
   val forceDescriptor = descriptorCacheRequest.valid &&
     (!lineCacheRequest.valid || descriptorDeferrals === 7.U)
-  // Payload traffic is already held by the sole one-entry cache egress in
-  // WindowEngine.  Arbitrate that registered request directly with the
-  // descriptor producer; retaining the former post-arbitration queue would
-  // add a second residency stage and reduce the effective 40+6 capacity.
-  io.dma_cache_req.valid :=
-    descriptorCacheRequest.valid || lineCacheRequest.valid
+  // Lock only the winning producer when a request is presented to the
+  // external cache boundary under backpressure.  The payload remains in the
+  // existing WindowEngine egress register, so this costs two control bits
+  // rather than another 128B-wide request register.  The lock also tells the
+  // Engine that this particular queue head is externally irrevocable.
+  val cacheArbLocked = RegInit(false.B)
+  val cacheArbDescriptor = RegInit(false.B)
+  val selectDescriptor = Mux(
+    cacheArbLocked, cacheArbDescriptor, forceDescriptor)
+  io.dma_cache_req.valid := Mux(
+    selectDescriptor, descriptorCacheRequest.valid, lineCacheRequest.valid)
   io.dma_cache_req.bits := Mux(
-    forceDescriptor, descriptorCacheRequest.bits, lineCacheRequest.bits)
+    selectDescriptor, descriptorCacheRequest.bits, lineCacheRequest.bits)
   descriptorCacheRequest.ready :=
-    io.dma_cache_req.ready && forceDescriptor
+    io.dma_cache_req.ready && selectDescriptor
   lineCacheRequest.ready :=
-    io.dma_cache_req.ready && !forceDescriptor
+    io.dma_cache_req.ready && !selectDescriptor
+  subsystem.io.cacheRequestHeld :=
+    cacheArbLocked && !cacheArbDescriptor
+  when(!cacheArbLocked && io.dma_cache_req.valid &&
+      !io.dma_cache_req.ready) {
+    cacheArbLocked := true.B
+    cacheArbDescriptor := forceDescriptor
+  }.elsewhen(cacheArbLocked && io.dma_cache_req.fire) {
+    cacheArbLocked := false.B
+  }
   when(io.dma_cache_req.fire) {
-    when(forceDescriptor) {
+    when(selectDescriptor) {
       descriptorDeferrals := 0.U
     }.elsewhen(descriptorCacheRequest.valid) {
       descriptorDeferrals := descriptorDeferrals + 1.U
@@ -798,6 +891,8 @@ class TmaV2DmaCore(
     subsystem.io.descriptorMemoryResponse.ready, subsystem.io.cacheResponse.ready)
   when(subsystem.io.descriptorMemoryResponse.fire) { descriptorCacheWait := false.B }
 
+  val sharedRequestHeld = RegInit(false.B)
+  subsystem.io.sharedRequestHeld := sharedRequestHeld
   val sharedSource = subsystem.io.sharedRequest.bits.source
   // WindowEngine owns the sole registered shared egress.  Format that stable
   // request directly for the shared-memory interface; a second queue here
@@ -823,6 +918,11 @@ class TmaV2DmaCore(
       subsystem.io.sharedRequest.bits.data(lane * 32 + 31, lane * 32)
   }
   subsystem.io.sharedRequest.ready := io.shared_req.ready
+  when(io.shared_req.fire) {
+    sharedRequestHeld := false.B
+  }.elsewhen(io.shared_req.valid && !io.shared_req.ready) {
+    sharedRequestHeld := true.B
+  }
   // Shared responses receive the same one-beat elastic input boundary.  The
   // registered data then feeds the compact word-routing/merge datapath.
   val sharedIngress = Module(new Queue(
@@ -854,8 +954,27 @@ class TmaV2DmaCore(
     new DmaCompletion, 1, pipe = true, flow = false))
   completionEgress.io.enq <> completionArb.io.out
   io.tma_completion <> completionEgress.io.deq
-  ingress.io.engineCompletion.valid := subsystem.io.completion.fire
-  ingress.io.engineCompletion.bits := subsystem.io.completion.bits
+  execute.io.engineCompletion.valid := subsystem.io.completion.fire
+  execute.io.engineCompletion.bits := subsystem.io.completion.bits
+
+  // A TMA-local kill completes only after every matching command has either
+  // drained or emitted its cleanup completion, and that completion has left
+  // the existing external sink. Descriptor transport is conservatively
+  // included because a prefetch has no command response with which to carry
+  // ASID ownership after its refill starts.
+  val completionPipelineBusy = completionEgress.io.deq.valid ||
+    completionArb.io.out.valid || ingress.io.directCompletion.valid ||
+    subsystem.io.completion.valid
+  val descriptorTransportBusy = descriptorNeedCache || descriptorCacheWait ||
+    (tlbBusy && !tlbOwnerLine) ||
+    (tlbIssueValid && !tlbIssueOwnerLine) ||
+    subsystem.io.descriptorMemoryRequest.valid
+  val killDrained = killActive && !ingress.io.killPending &&
+    !execute.io.killPending && !subsystem.io.killPending &&
+    !completionPipelineBusy && !descriptorTransportBusy
+  io.killDone.valid := killDrained
+  io.killDone.bits.asid := killAsid
+  when(killDrained) { killActive := false.B }
 
   if (PMU_TMA) {
     val perf = RegInit(0.U.asTypeOf(new TmaPerfCounters))
@@ -870,6 +989,8 @@ class TmaV2DmaCore(
       RegInit(0.U(subsystem.io.activeShared.getWidth.W))
     val maxActiveWriteAcks =
       RegInit(0.U(subsystem.io.activeWriteAcks.getWidth.W))
+    val maxCommandQueueOccupancy =
+      RegInit(0.U(ingress.io.commandQueueOccupancy.getWidth.W))
     val cacheIssueCycle = Reg(Vec(cacheSourceEntries, UInt(32.W)))
     val perfCommandDirection = RegInit(TmaV2Spec.DirectionG2S.U(1.W))
     val cacheResponseSource = subsystem.io.cacheResponse.bits.source
@@ -899,9 +1020,10 @@ class TmaV2DmaCore(
       maxActiveRequests := 0.U
       maxActiveShared := 0.U
       maxActiveWriteAcks := 0.U
+      maxCommandQueueOccupancy := 0.U
     }.elsewhen(io.perfEnable) {
       perfCycle := perfCycle + 1.U
-      when(ingress.io.window.fire) {
+      when(execute.io.window.fire) {
         val nextRun = windowFireRun + 1.U
         windowFireRun := nextRun
         when(nextRun > longestWindowFireRun) {
@@ -911,7 +1033,7 @@ class TmaV2DmaCore(
         windowFireRun := 0.U
       }
       perf.instIssued := perf.instIssued + io.dma_req.fire.asUInt
-      perf.lineIssued := perf.lineIssued + ingress.io.window.fire.asUInt
+      perf.lineIssued := perf.lineIssued + execute.io.window.fire.asUInt
       perf.putFull := perf.putFull + (s2gCopyCacheRequest && lineMask.andR).asUInt
       perf.putPart := perf.putPart + (s2gCopyCacheRequest && !lineMask.andR).asUInt
       perf.bytesWritten := perf.bytesWritten + Mux(s2gCacheRequest,
@@ -922,10 +1044,10 @@ class TmaV2DmaCore(
         (sharedResponse.fire && !sharedResponse.bits.isWrite).asUInt
       perf.tlbReq := perf.tlbReq + io.to_l2TLB.fire.asUInt
       perf.g2sLineCount := perf.g2sLineCount +
-        (ingress.io.window.fire &&
+        (execute.io.window.fire &&
           perfCommandDirection === TmaV2Spec.DirectionG2S.U).asUInt
       perf.s2gLineCount := perf.s2gLineCount +
-        (ingress.io.window.fire &&
+        (execute.io.window.fire &&
           perfCommandDirection === TmaV2Spec.DirectionS2G.U).asUInt
       perf.g2sCompletionCount := perf.g2sCompletionCount +
         (subsystem.io.completion.fire &&
@@ -984,11 +1106,29 @@ class TmaV2DmaCore(
           subsystem.io.descriptorEvents.compileCycle.asUInt
       perf.bindCycles := perf.bindCycles + ingress.io.bindCycle.asUInt
       perf.plannerProduced :=
-        perf.plannerProduced + ingress.io.plannerProduced.asUInt
+        perf.plannerProduced + execute.io.plannerProduced.asUInt
       perf.plannerFire :=
-        perf.plannerFire + ingress.io.plannerFire.asUInt
+        perf.plannerFire + execute.io.plannerFire.asUInt
       perf.plannerStallCycles :=
-        perf.plannerStallCycles + ingress.io.plannerStalled.asUInt
+        perf.plannerStallCycles + execute.io.plannerStalled.asUInt
+      perf.commandQueueFullCycles := perf.commandQueueFullCycles +
+        ingress.io.commandQueueFull.asUInt
+      perf.prepareBusyCycles := perf.prepareBusyCycles +
+        ingress.io.prepareBusy.asUInt
+      perf.preparedExecuteStallCycles :=
+        perf.preparedExecuteStallCycles + ingress.io.preparedStall.asUInt
+      perf.descriptorAddressInvalidates :=
+        perf.descriptorAddressInvalidates +
+          ingress.io.descriptorAddressInvalidate.asUInt
+      perf.descriptorAllInvalidates := perf.descriptorAllInvalidates +
+        ingress.io.descriptorAllInvalidate.asUInt
+      perf.queuedKills := perf.queuedKills + ingress.io.queuedKill.asUInt
+      perf.preparedKills := perf.preparedKills + ingress.io.preparedKill.asUInt
+      perf.activeKills := perf.activeKills + execute.io.activeKill.asUInt
+      perf.killDrainCycles := perf.killDrainCycles + execute.io.killDrain.asUInt
+      when(ingress.io.commandQueueOccupancy > maxCommandQueueOccupancy) {
+        maxCommandQueueOccupancy := ingress.io.commandQueueOccupancy
+      }
       when(subsystem.io.activeWindows > maxActiveWindows) {
         maxActiveWindows := subsystem.io.activeWindows
       }
@@ -1004,7 +1144,7 @@ class TmaV2DmaCore(
 
       if (PMU_TMA_DETAIL) {
         perf.lineFullStallCycles := perf.lineFullStallCycles +
-          (ingress.io.window.valid && !ingress.io.window.ready).asUInt
+          (execute.io.window.valid && !execute.io.window.ready).asUInt
         perf.ackTagFullStallCycles := perf.ackTagFullStallCycles +
           subsystem.io.writeAckFull.asUInt
         perf.commandSlotFullStallCycles := perf.commandSlotFullStallCycles +
@@ -1036,6 +1176,7 @@ class TmaV2DmaCore(
     perfOutput.maxActiveShared := maxActiveShared
     perfOutput.maxActiveWriteAcks := maxActiveWriteAcks
     perfOutput.longestWindowFireRun := longestWindowFireRun
+    perfOutput.maxCommandQueueOccupancy := maxCommandQueueOccupancy
     io.perf_tma.foreach(_ := perfOutput)
   }
 
@@ -1059,7 +1200,8 @@ class tma(
     requestEntries: Int = TmaV2Spec.DefaultGlobalRequestEntries,
     sharedEntries: Int = TmaV2Spec.DefaultSharedReadyEntries,
     writeAckEntries: Int = TmaV2Spec.DefaultWriteAckEntries,
-    descriptorEntries: Int = TmaV2Spec.DefaultDescriptorEntries)(
+    descriptorEntries: Int = TmaV2Spec.DefaultDescriptorEntries,
+    commandEntries: Int = TmaV2Spec.DefaultCommandQueueEntries)(
     implicit p: Parameters) extends Module {
   val io = IO(new DmaCoreIO)
   val core = Module(new TmaV2DmaCore(
@@ -1067,7 +1209,8 @@ class tma(
     requestEntries = requestEntries,
     sharedEntries = sharedEntries,
     writeAckEntries = writeAckEntries,
-    descriptorEntries = descriptorEntries))
+    descriptorEntries = descriptorEntries,
+    commandEntries = commandEntries))
   core.io.dma_req <> io.dma_req
   core.io.dma_cache_rsp <> io.dma_cache_rsp
   core.io.shared_rsp <> io.shared_rsp
@@ -1079,6 +1222,8 @@ class tma(
   io.to_l2TLB <> core.io.to_l2TLB
   core.io.from_l2TLB <> io.from_l2TLB
   io.status := core.io.status
+  core.io.killReq <> io.killReq
+  io.killDone := core.io.killDone
   core.io.perfEnable := io.perfEnable
   core.io.perfReset := io.perfReset
   if (PMU_TMA) io.perf_tma.foreach(_ := core.io.perf_tma.get)

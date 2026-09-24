@@ -3,7 +3,7 @@ package top
 import circt.stage.ChiselStage
 import config.config.Parameters
 import L1Cache.MyConfig
-import pipeline.{TmaV2DescriptorService, TmaV2DmaCore, TmaV2WindowEngine, TmaV2WindowSubsystem, TmaV2WindowPlanner, tma}
+import pipeline.{TmaV2CommandQueue, TmaV2DescriptorService, TmaV2DmaCore, TmaV2WindowEngine, TmaV2WindowSubsystem, TmaV2WindowPlanner, tma}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
@@ -31,6 +31,8 @@ object TmaV2_gen extends App {
     "--write-ack-entries", pipeline.TmaV2Spec.DefaultWriteAckEntries)
   private val descriptorEntries = intOption(
     "--descriptor-entries", pipeline.TmaV2Spec.DefaultDescriptorEntries)
+  private val commandEntries = intOption(
+    "--command-entries", pipeline.TmaV2Spec.DefaultCommandQueueEntries)
   Files.createDirectories(outputDir)
 
   val options = Array(
@@ -39,6 +41,9 @@ object TmaV2_gen extends App {
     "-lowering-options=disallowLocalVariables"
   )
   val modules = Seq(
+    "TmaV2CommandQueue.sv" ->
+      ChiselStage.emitSystemVerilog(
+        new TmaV2CommandQueue(commandEntries), firtoolOpts = options),
     "TmaV2WindowPlanner.sv" ->
       ChiselStage.emitSystemVerilog(
         new TmaV2WindowPlanner, firtoolOpts = options),
@@ -69,7 +74,8 @@ object TmaV2_gen extends App {
           requestEntries = requestEntries,
           sharedEntries = sharedEntries,
           writeAckEntries = writeAckEntries,
-          descriptorEntries = descriptorEntries),
+          descriptorEntries = descriptorEntries,
+          commandEntries = commandEntries),
         firtoolOpts = options),
     "tma.sv" ->
       ChiselStage.emitSystemVerilog(
@@ -78,7 +84,8 @@ object TmaV2_gen extends App {
           requestEntries = requestEntries,
           sharedEntries = sharedEntries,
           writeAckEntries = writeAckEntries,
-          descriptorEntries = descriptorEntries),
+          descriptorEntries = descriptorEntries,
+          commandEntries = commandEntries),
         firtoolOpts = options)
   )
   modules.foreach { case (name, contents) =>

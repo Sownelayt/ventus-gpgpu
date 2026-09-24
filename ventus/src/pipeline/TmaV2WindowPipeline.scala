@@ -11,7 +11,7 @@ class TmaV2CursorExpandToken extends Bundle {
   // 32-bit coordinates per lane duplicated command-stable origins and made
   // the CursorExpand queue the largest Planner register bank.
   val laneIndex =
-    Vec(8, Vec(TmaV2Spec.RankMax, UInt(9.W)))
+    Vec(8, Vec(TmaV2Spec.RankMax, UInt(10.W)))
   // GlobalMap consumes only the sum, never the five independent dimension
   // components. Cursor state keeps the vector needed for the next window.
   val laneComponentSum = Vec(8, SInt(64.W))
@@ -34,7 +34,7 @@ class TmaV2CursorExpandToken extends Bundle {
 class TmaV2CursorCarryToken extends Bundle {
   // Lane eight is the next-window cursor and is not emitted downstream.
   val laneIndex =
-    Vec(9, Vec(TmaV2Spec.RankMax, UInt(9.W)))
+    Vec(9, Vec(TmaV2Spec.RankMax, UInt(10.W)))
   // Entry d stores carry into dimension d+1.  This is enough to reconstruct
   // both the incoming carry and quotient for every nonzero dimension.
   val laneCarry =
@@ -52,7 +52,7 @@ class TmaV2CursorCarryToken extends Bundle {
   * dimension-zero wrap as well as the carry entering dimension two.
   */
 class TmaV2CursorLowCarryToken extends Bundle {
-  val laneIndex = Vec(9, Vec(2, UInt(9.W)))
+  val laneIndex = Vec(9, Vec(2, UInt(10.W)))
   val laneCarry = Vec(9, Vec(2, UInt(4.W)))
   val cursorRow = UInt(3.W)
   val logicalWindowIndex = UInt(25.W)
@@ -66,7 +66,7 @@ class TmaV2CursorLowCarryToken extends Bundle {
   * following window and HighCarry finish dimension four concurrently.
   */
 class TmaV2CursorMidCarryToken extends Bundle {
-  val laneIndex = Vec(9, Vec(4, UInt(9.W)))
+  val laneIndex = Vec(9, Vec(4, UInt(10.W)))
   val laneCarry = Vec(9, Vec(4, UInt(4.W)))
   val cursorRow = UInt(3.W)
   val logicalWindowIndex = UInt(25.W)
@@ -115,6 +115,287 @@ class TmaV2Window extends Bundle {
   val last = Bool()
 }
 
+/** Command-local configuration for the interleaved dim0 slow path. */
+class TmaV2Dim0StrideConfig extends Bundle {
+  val sharedBase = UInt(32.W)
+  val strideMinus1 = UInt(3.W)
+  val rawPositions = UInt(9.W)
+  val interleave = UInt(2.W)
+  val swizzle = UInt(3.W)
+}
+
+/**
+  * Whole-atom compactor for active interleaved dim0 traversal stride.
+  *
+  * The raw planner presents complete 16-byte atoms in traversal order.  A
+  * 32-byte interleave position is represented by two adjacent lanes.  The
+  * compactor selects positions 0, stride, 2*stride, ... independently in
+  * every raw dim0 row and assigns the selected atoms a dense shared-memory
+  * ordinal.  At most eight selected atoms are retained between input
+  * windows; the current input window is combined with that remainder only
+  * while its Decoupled payload is stable.
+  *
+  * Unit stride never enters this module.  Flush is kill-dominant and clears
+  * the command configuration, remainder and final-drain ownership together.
+  */
+class TmaV2Dim0StrideCompactor extends Module {
+  val io = IO(new Bundle {
+    val start = Flipped(Valid(new TmaV2Dim0StrideConfig))
+    val in = Flipped(Decoupled(new TmaV2Window))
+    val out = Decoupled(new TmaV2Window)
+    val flush = Input(Bool())
+    val busy = Output(Bool())
+  })
+
+  val commandBusy = RegInit(false.B)
+  val config = Reg(new TmaV2Dim0StrideConfig)
+  val remainder = Reg(Vec(8, new TmaV2WindowLane))
+  val remainderCount = RegInit(0.U(4.W))
+  val drainLast = RegInit(false.B)
+  val rawPosition = RegInit(0.U(9.W))
+  val rawPhase = RegInit(0.U(3.W))
+  val rawSecondHalf = RegInit(false.B)
+  val outputWindowIndex = RegInit(0.U(25.W))
+
+  val stride = config.strideMinus1.pad(4) + 1.U(4.W)
+  val pairMode = config.interleave === TmaV2Spec.Interleave32.U
+  // ElementStride compacts into a dense 128B logical window before CUDA's
+  // window-relative swizzle is applied.  Short compacted rows do not acquire
+  // the planner's ordinary row pitch; V4 byte traces distinguish these two
+  // mappings explicitly.
+  val outputCapacity = 8.U(4.W)
+
+  // Advance the raw row position and its modulo-stride phase once per
+  // complete interleave atom.  A 32B position advances only after its second
+  // 16B half.  Reset at rawPositions is essential: a single repeating mask
+  // is insufficient when a row length is not divisible by the stride.
+  val lanePosition = Wire(Vec(9, UInt(9.W)))
+  val lanePhase = Wire(Vec(9, UInt(3.W)))
+  val laneSecondHalf = Wire(Vec(9, Bool()))
+  lanePosition(0) := rawPosition
+  lanePhase(0) := rawPhase
+  laneSecondHalf(0) := rawSecondHalf
+
+  val selectedMask = Wire(Vec(8, Bool()))
+  for (lane <- 0 until 8) {
+    val laneValid = io.in.bits.lanes(lane).valid
+    selectedMask(lane) := laneValid && lanePhase(lane) === 0.U
+    val completesPosition = !pairMode || laneSecondHalf(lane)
+    val nextPosition = lanePosition(lane).pad(10) +& 1.U
+    val wrapsRow = nextPosition >= config.rawPositions.pad(10)
+    val incrementedPhase = lanePhase(lane) + 1.U
+    val nextPhase = Mux(
+      incrementedPhase >= stride, 0.U, incrementedPhase(2, 0))
+    lanePosition(lane + 1) := Mux(
+      laneValid && completesPosition,
+      Mux(wrapsRow, 0.U, nextPosition(8, 0)),
+      lanePosition(lane))
+    lanePhase(lane + 1) := Mux(
+      laneValid && completesPosition,
+      Mux(wrapsRow, 0.U, nextPhase),
+      lanePhase(lane))
+    laneSecondHalf(lane + 1) := Mux(
+      laneValid,
+      Mux(pairMode, !laneSecondHalf(lane), false.B),
+      laneSecondHalf(lane))
+  }
+
+  // Prefix-popcount gives every selected lane a compact local ordinal.  It
+  // is a three-level small-adder network rather than an 8x8 byte crossbar.
+  val selectedPrefix = Wire(Vec(9, UInt(4.W)))
+  selectedPrefix(0) := 0.U
+  for (lane <- 0 until 8)
+    selectedPrefix(lane + 1) :=
+      selectedPrefix(lane) + selectedMask(lane).asUInt
+  val selectedCount = selectedPrefix(8)
+  val compacted = Wire(Vec(8, new TmaV2WindowLane))
+  for (destination <- 0 until 8) {
+    compacted(destination) := 0.U.asTypeOf(new TmaV2WindowLane)
+    val choices = (0 until 8).map { source =>
+      selectedMask(source) &&
+        selectedPrefix(source) === destination.U
+    }
+    when(choices.reduce(_ || _)) {
+      compacted(destination) := Mux1H(
+        choices, io.in.bits.lanes)
+    }
+  }
+
+  // Merge the registered remainder and the compacted current input.  The
+  // merged vector is not stored wholesale: after an output handshake only
+  // its at-most-seven-lane tail becomes the next remainder.
+  val merged = Wire(Vec(16, new TmaV2WindowLane))
+  for (index <- 0 until 16) {
+    merged(index) := 0.U.asTypeOf(new TmaV2WindowLane)
+    if (index < 8) {
+      when(index.U < remainderCount) {
+        merged(index) := remainder(index)
+      }.otherwise {
+        val compactedIndex = index.U(5.W) - remainderCount
+        when(compactedIndex < selectedCount) {
+          merged(index) := compacted(compactedIndex(2, 0))
+        }
+      }
+    } else {
+      val compactedIndex = index.U(5.W) - remainderCount
+      when(compactedIndex < selectedCount) {
+        merged(index) := compacted(compactedIndex(2, 0))
+      }
+    }
+  }
+  val mergedCount = remainderCount +& selectedCount
+
+  // A full eight-lane remainder is deliberately retained until one more raw
+  // input window is visible.  That lookahead distinguishes a non-final full
+  // compacted window from the case where the raw planner ends with only
+  // unselected interleave32 positions.  Without it, the full window would be
+  // emitted with last=false and the trailing empty raw window would try to
+  // create an illegal zero-lane last window.
+  val registeredOutput = drainLast && remainderCount =/= 0.U
+  val registeredEmitCount = Mux(
+    remainderCount > outputCapacity, outputCapacity, remainderCount)
+  val combinedNeedsOutput = mergedCount > outputCapacity ||
+    (io.in.bits.last && mergedCount =/= 0.U)
+  val combinedOutput = !registeredOutput && !drainLast &&
+    io.in.valid && combinedNeedsOutput
+  val combinedEmitCount = Mux(
+    mergedCount > outputCapacity, outputCapacity, mergedCount(3, 0))
+  val emitCount = Mux(
+    registeredOutput, registeredEmitCount, combinedEmitCount)
+
+  val outputLanes = Wire(Vec(8, new TmaV2WindowLane))
+  for (lane <- 0 until 8) {
+    outputLanes(lane) := Mux(
+      registeredOutput, remainder(lane), merged(lane))
+  }
+
+  io.out.valid := commandBusy && !io.flush &&
+    (registeredOutput || combinedOutput)
+  io.out.bits := 0.U.asTypeOf(new TmaV2Window)
+  io.out.bits.sharedBase :=
+    config.sharedBase + (outputWindowIndex << 7)
+  io.out.bits.last := Mux(registeredOutput,
+    drainLast && remainderCount <= outputCapacity,
+    io.in.bits.last && mergedCount <= outputCapacity)
+
+  val swizzleMask = (1.U(8.W) << config.swizzle) - 1.U
+  val sharedPhase =
+    ((config.sharedBase >> 7) + outputWindowIndex) & swizzleMask
+  for (lane <- 0 until 8) {
+    val laneActive = lane.U < emitCount
+    val swizzled = (lane.U ^ sharedPhase) << 4
+    val physical = Mux(
+      config.swizzle === TmaV2Spec.SwizzleNone.U,
+      (lane * 16).U, swizzled)
+    io.out.bits.lanes(lane) := outputLanes(lane)
+    io.out.bits.lanes(lane).valid := laneActive
+    io.out.bits.lanes(lane).sharedAtomDelta := physical(6, 4)
+    when(!laneActive) {
+      io.out.bits.lanes(lane).globalBytes := 0.U
+      io.out.bits.lanes(lane).sharedBytes := 0.U
+    }
+  }
+
+  // When the output is sourced from the current input, acceptance is tied to
+  // the output handshake.  A stalled output therefore also freezes the raw
+  // mask, input payload and shared ordinal.  A full pending remainder may
+  // consume selection-empty lookahead windows without producing output; the
+  // first later selection proves it is non-final, while raw `last` proves it
+  // is the final full output.
+  io.in.ready := commandBusy && !io.flush && !registeredOutput &&
+    !drainLast && Mux(combinedNeedsOutput, io.out.ready, true.B)
+
+  when(io.in.fire) {
+    rawPosition := lanePosition(8)
+    rawPhase := lanePhase(8)
+    rawSecondHalf := laneSecondHalf(8)
+  }
+
+  when(io.in.fire && !combinedNeedsOutput) {
+    remainderCount := mergedCount
+    for (lane <- 0 until 8)
+      when(lane.U < mergedCount) { remainder(lane) := merged(lane) }
+  }
+
+  when(io.out.fire) {
+    outputWindowIndex := outputWindowIndex + 1.U
+    when(registeredOutput) {
+      val remaining = remainderCount - emitCount
+      remainderCount := remaining
+      for (lane <- 0 until 8) {
+        val source = lane.U + emitCount
+        when(lane.U < remaining) {
+          remainder(lane) := remainder(source(2, 0))
+        }
+      }
+      when(io.out.bits.last) {
+        commandBusy := false.B
+        drainLast := false.B
+      }
+    }.otherwise {
+      val remaining = mergedCount - emitCount
+      remainderCount := remaining
+      for (lane <- 0 until 8) {
+        val source = lane.U + emitCount
+        when(lane.U < remaining) {
+          remainder(lane) := merged(source(3, 0))
+        }
+      }
+      drainLast := io.in.bits.last && remaining =/= 0.U
+      when(io.out.bits.last) {
+        commandBusy := false.B
+        drainLast := false.B
+      }
+    }
+  }
+
+  when(io.start.valid) {
+    commandBusy := true.B
+    config := io.start.bits
+    remainderCount := 0.U
+    drainLast := false.B
+    rawPosition := 0.U
+    rawPhase := 0.U
+    rawSecondHalf := false.B
+    outputWindowIndex := 0.U
+  }
+  when(io.flush) {
+    commandBusy := false.B
+    remainderCount := 0.U
+    drainLast := false.B
+    rawPosition := 0.U
+    rawPhase := 0.U
+    rawSecondHalf := false.B
+    outputWindowIndex := 0.U
+  }
+
+  io.busy := commandBusy || remainderCount =/= 0.U || drainLast
+
+  when(!reset.asBool) {
+    assert(!io.start.valid || !commandBusy,
+      "dim0 compactor commands must not overlap")
+    assert(!commandBusy || config.strideMinus1 =/= 0.U,
+      "unit dim0 stride must bypass the compactor")
+    assert(!commandBusy || config.rawPositions =/= 0.U)
+    assert(remainderCount <= 8.U)
+    when(io.in.fire && io.in.bits.last) {
+      assert(mergedCount =/= 0.U,
+        "a legal dim0 traversal must retain at least one selected atom")
+    }
+    when(io.in.fire && pairMode) {
+      assert(!laneSecondHalf(8),
+        "interleave32 planner windows must preserve complete 32B pairs")
+      assert(!selectedCount(0),
+        "interleave32 selection must retain adjacent 16B halves")
+    }
+    when(io.out.fire) {
+      assert(PopCount(io.out.bits.lanes.map(_.valid)) === emitCount)
+      assert(emitCount > 0.U && emitCount <= 8.U)
+      when(pairMode) { assert(!emitCount(0)) }
+    }
+  }
+}
+
 /**
   * Eight-stage elastic eight-lane 5D planner.
   *
@@ -130,6 +411,7 @@ class TmaV2WindowPlanner extends Module {
   val io = IO(new Bundle {
     val in = Flipped(Decoupled(new TmaV2BoundCommand))
     val out = Decoupled(new TmaV2Window)
+    val flush = Input(Bool())
     val produced = Output(Bool())
     val stalled = Output(Bool())
   })
@@ -137,7 +419,7 @@ class TmaV2WindowPlanner extends Module {
   val commandBusy = RegInit(false.B)
   val producerDone = RegInit(false.B)
   val command = Reg(new TmaV2BoundCommand)
-  val cursorIndex = Reg(Vec(TmaV2Spec.RankMax, UInt(9.W)))
+  val cursorIndex = Reg(Vec(TmaV2Spec.RankMax, UInt(10.W)))
   val componentCursor = Reg(Vec(TmaV2Spec.RankMax, SInt(64.W)))
   val cursorRow = RegInit(0.U(3.W))
   val logicalWindowIndex = RegInit(0.U(25.W))
@@ -146,7 +428,6 @@ class TmaV2WindowPlanner extends Module {
   // recreated in every lane and planner stage.
   val commandDtypeBits = Reg(UInt(7.W))
   val commandByteShift = Reg(UInt(3.W))
-  val commandChannelsLog2 = Reg(UInt(4.W))
   val paddedFp4 = Reg(Bool())
   val paddedFp6 = Reg(Bool())
   val packedFp4 = Reg(Bool())
@@ -160,9 +441,8 @@ class TmaV2WindowPlanner extends Module {
     TmaV2DescriptorDerived.dtypeBits(io.in.bits.compiled.dtype)
   val incomingByteShift =
     TmaV2DescriptorDerived.elementByteShift(incomingDtypeBits)
-  val incomingChannelsLog2 =
-    TmaV2DescriptorDerived.channelsLog2(
-      io.in.bits.compiled.interleave, incomingByteShift)
+  val incomingInterleaved =
+    io.in.bits.compiled.interleave =/= TmaV2Spec.InterleaveNone.U
   val incomingPaddedFp4 =
     io.in.bits.compiled.dtype === TmaV2Spec.DTypeB4x16P64.U
   val incomingPaddedFp6 =
@@ -170,14 +450,15 @@ class TmaV2WindowPlanner extends Module {
   val incomingPackedFp4 =
     io.in.bits.compiled.dtype === TmaV2Spec.DTypeB4x16.U
   val incomingPaddedSubByte = incomingPaddedFp4 || incomingPaddedFp6
-  val incomingLaneElementShift = MuxLookup(
-    incomingDtypeBits, 0.U(3.W))(Seq(
+  val incomingLaneElementShift = Mux(
+    incomingInterleaved, 0.U,
+    MuxLookup(incomingDtypeBits, 0.U(3.W))(Seq(
       4.U -> Mux(incomingPaddedFp4, 4.U, 5.U),
       6.U -> 4.U,
       8.U -> 4.U,
       16.U -> 3.U,
       32.U -> 2.U,
-      64.U -> 1.U))
+      64.U -> 1.U)))
   val incomingPayloadBytes = Mux(incomingPaddedFp4, 8.U(5.W),
     Mux(incomingPaddedFp6, 12.U(5.W), 16.U(5.W)))
   // CUDA gives every swizzled logical row a physical pitch equal to the
@@ -195,13 +476,15 @@ class TmaV2WindowPlanner extends Module {
       32.U -> (io.in.bits.compiled.boxDims(0) << 2),
       64.U -> (io.in.bits.compiled.boxDims(0) << 3)))
   val incomingSharedRowBytes = Mux(
-    incomingPaddedSubByte, 128.U, incomingOrdinarySharedRowBytes)
+    incomingInterleaved, 128.U,
+    Mux(incomingPaddedSubByte, 128.U, incomingOrdinarySharedRowBytes))
   val incomingAtomsPerSwizzleRow = incomingSharedRowBytes >> 4
   val incomingRowsPerSwizzleShift = 3.U - io.in.bits.compiled.swizzle
   val incomingSwizzleLaneCount =
     incomingAtomsPerSwizzleRow << incomingRowsPerSwizzleShift
   val incomingPlannedLaneCount = Mux(
-    io.in.bits.compiled.swizzle === TmaV2Spec.SwizzleNone.U,
+    incomingInterleaved ||
+      io.in.bits.compiled.swizzle === TmaV2Spec.SwizzleNone.U,
     8.U(4.W), incomingSwizzleLaneCount(3, 0))
 
   // Multiply an at-most 64-bit value by a factor in [0, 8] using shifts and
@@ -287,24 +570,28 @@ class TmaV2WindowPlanner extends Module {
     0.U(67.W) +: stage
   }
 
-  def dim0DeltaAt(index: UInt): UInt = {
-    val coordinate = command.coordinates(0) + index.zext
-    val inSlice = coordinate.asUInt &
-      ((1.U(64.W) << commandChannelsLog2) - 1.U)
-    Mux(paddedSubByte, payloadBytes,
-      MuxLookup(command.compiled.interleave, 16.U(64.W))(Seq(
-        TmaV2Spec.Interleave16.U ->
-          command.compiled.interleaveSliceStride,
-        TmaV2Spec.Interleave32.U -> Mux(inSlice === 0.U, 16.U,
-          command.compiled.interleaveSliceStride - 16.U))))
-  }
+  // Interleave32 exposes one 32B traversal position as two adjacent planner
+  // lanes. Ten bits are therefore required for the maximum 256-position
+  // box; all other dimensions retain their 1..256 compiled count.
+  val dim0PlannerBox = Mux(
+    command.compiled.interleave === TmaV2Spec.Interleave32.U,
+    (command.compiled.boxDims(0).pad(10) << 1)(9, 0),
+    command.compiled.boxDims(0).pad(10))
+  def plannerBoxDim(dimension: Int): UInt =
+    if (dimension == 0) dim0PlannerBox
+    else command.compiled.boxDims(dimension).pad(10)
+
+  def dim0DeltaAt(index: UInt): UInt =
+    Mux(command.compiled.interleave =/= TmaV2Spec.InterleaveNone.U,
+      16.U(64.W),
+      Mux(paddedSubByte, payloadBytes, 16.U(64.W)))
 
   // Split the five-rank mixed-radix recurrence 2+2+1.  Each stage owns its
   // slice of cursorIndex and therefore forms a systolic recurrence: LowCarry
   // can start window N+2 while MidCarry works on N+1 and HighCarry finishes N.
   // Merely registering a partial combinational result without splitting the
   // feedback ownership would lengthen the recurrence and reduce throughput.
-  val lowLaneIndex = Wire(Vec(9, Vec(2, UInt(9.W))))
+  val lowLaneIndex = Wire(Vec(9, Vec(2, UInt(10.W))))
   val lowLaneCarry = Wire(Vec(9, Vec(3, UInt(4.W))))
 
   for (lane <- 0 to 8) {
@@ -318,17 +605,19 @@ class TmaV2WindowPlanner extends Module {
       }
       val total = cursorIndex(dimension).pad(12) +& increment
       val (quotient, remainder) = smallDivRem(
-        total(11, 0), command.compiled.boxDims(dimension).pad(12))
+        total(11, 0), plannerBoxDim(dimension).pad(12))
       lowLaneIndex(lane)(dimension) := Mux(
-        used, remainder(8, 0), cursorIndex(dimension))
+        used, remainder(9, 0), cursorIndex(dimension))
       lowLaneCarry(lane)(dimension + 1) := Mux(
         used, quotient, increment(3, 0))
     }
   }
 
   val lowCarryStage = Module(new Queue(
-    new TmaV2CursorLowCarryToken, 1, pipe = true, flow = false))
-  lowCarryStage.io.enq.valid := commandBusy && !producerDone
+    new TmaV2CursorLowCarryToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  lowCarryStage.io.flush.foreach(_ := io.flush)
+  lowCarryStage.io.enq.valid := commandBusy && !producerDone && !io.flush
   lowCarryStage.io.enq.bits :=
     0.U.asTypeOf(new TmaV2CursorLowCarryToken)
   lowCarryStage.io.enq.bits.cursorRow := cursorRow
@@ -350,7 +639,7 @@ class TmaV2WindowPlanner extends Module {
   }
 
   val lowCarryToken = lowCarryStage.io.deq.bits
-  val midLaneIndex = Wire(Vec(9, Vec(4, UInt(9.W))))
+  val midLaneIndex = Wire(Vec(9, Vec(4, UInt(10.W))))
   val midLaneCarry = Wire(Vec(9, Vec(4, UInt(4.W))))
   val midCarryChain = Wire(Vec(9, Vec(3, UInt(4.W))))
 
@@ -368,9 +657,9 @@ class TmaV2WindowPlanner extends Module {
       val increment = midCarryChain(lane)(midDimension).pad(12)
       val total = cursorIndex(dimension).pad(12) +& increment
       val (quotient, remainder) = smallDivRem(
-        total(11, 0), command.compiled.boxDims(dimension).pad(12))
+        total(11, 0), plannerBoxDim(dimension).pad(12))
       midLaneIndex(lane)(dimension) := Mux(
-        used, remainder(8, 0), cursorIndex(dimension))
+        used, remainder(9, 0), cursorIndex(dimension))
       midCarryChain(lane)(midDimension + 1) := Mux(
         used, quotient, increment(3, 0))
       midLaneCarry(lane)(dimension) :=
@@ -379,8 +668,11 @@ class TmaV2WindowPlanner extends Module {
   }
 
   val midCarryStage = Module(new Queue(
-    new TmaV2CursorMidCarryToken, 1, pipe = true, flow = false))
-  midCarryStage.io.enq.valid := lowCarryStage.io.deq.valid && !producerDone
+    new TmaV2CursorMidCarryToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  midCarryStage.io.flush.foreach(_ := io.flush)
+  midCarryStage.io.enq.valid :=
+    lowCarryStage.io.deq.valid && !producerDone && !io.flush
   lowCarryStage.io.deq.ready := Mux(
     producerDone, true.B, midCarryStage.io.enq.ready)
   midCarryStage.io.enq.bits :=
@@ -399,7 +691,7 @@ class TmaV2WindowPlanner extends Module {
   }
 
   val midCarryToken = midCarryStage.io.deq.bits
-  val laneIndex = Wire(Vec(9, Vec(TmaV2Spec.RankMax, UInt(9.W))))
+  val laneIndex = Wire(Vec(9, Vec(TmaV2Spec.RankMax, UInt(10.W))))
   val laneCarry = Wire(Vec(9, Vec(TmaV2Spec.RankMax, UInt(4.W))))
 
   for (lane <- 0 to 8) {
@@ -413,14 +705,17 @@ class TmaV2WindowPlanner extends Module {
     val increment = midCarryToken.laneCarry(lane)(3).pad(12)
     val total = cursorIndex(4).pad(12) +& increment
     val (quotient, remainder) = smallDivRem(
-      total(11, 0), command.compiled.boxDims(4).pad(12))
-    laneIndex(lane)(4) := Mux(used, remainder(8, 0), cursorIndex(4))
+      total(11, 0), plannerBoxDim(4).pad(12))
+    laneIndex(lane)(4) := Mux(used, remainder(9, 0), cursorIndex(4))
     laneCarry(lane)(4) := Mux(used, quotient, increment(3, 0))
   }
 
   val carryStage = Module(new Queue(
-    new TmaV2CursorCarryToken, 1, pipe = true, flow = false))
-  carryStage.io.enq.valid := midCarryStage.io.deq.valid && !producerDone
+    new TmaV2CursorCarryToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  carryStage.io.flush.foreach(_ := io.flush)
+  carryStage.io.enq.valid :=
+    midCarryStage.io.deq.valid && !producerDone && !io.flush
   // HighCarry discovers the final carry only as it accepts the last token.
   // Pipe queues may simultaneously admit one younger token in each upstream
   // stage; once producerDone is set, drain both speculative tokens without
@@ -452,11 +747,11 @@ class TmaV2WindowPlanner extends Module {
   val baseDeltas = (0 until 8).map { step =>
     val index = carryToken.laneIndex(0)(0) +
       (step.U(12.W) << laneElementShift)(11, 0)
-    dim0DeltaAt(index(8, 0))
+    dim0DeltaAt(index(9, 0))
   }
   val originDeltas = (0 until 8).map { step =>
     val index = (step.U(12.W) << laneElementShift)(11, 0)
-    dim0DeltaAt(index(8, 0))
+    dim0DeltaAt(index(9, 0))
   }
   val baseDeltaPrefix = prefixSums(baseDeltas)
   val originDeltaPrefix = prefixSums(originDeltas)
@@ -505,8 +800,10 @@ class TmaV2WindowPlanner extends Module {
   }
 
   val cursorStage = Module(new Queue(
-    new TmaV2CursorExpandToken, 1, pipe = true, flow = false))
-  cursorStage.io.enq.valid := carryStage.io.deq.valid
+    new TmaV2CursorExpandToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  cursorStage.io.flush.foreach(_ := io.flush)
+  cursorStage.io.enq.valid := carryStage.io.deq.valid && !io.flush
   carryStage.io.deq.ready := cursorStage.io.enq.ready
   cursorStage.io.enq.bits := 0.U.asTypeOf(new TmaV2CursorExpandToken)
   cursorStage.io.enq.bits.logicalWindowIndex :=
@@ -544,6 +841,10 @@ class TmaV2WindowPlanner extends Module {
   val mappedPaddedSubByte = mappedPaddedFp4 || mappedPaddedFp6
   val mappedDtypeBits = commandDtypeBits
   val mappedPackedFp4 = packedFp4
+  val mappedInterleaved =
+    command.compiled.interleave =/= TmaV2Spec.InterleaveNone.U
+  val mappedInterleave32 =
+    command.compiled.interleave === TmaV2Spec.Interleave32.U
   val mappedElementByteShift = commandByteShift
   val mappedElementsPerLane =
     (1.U(9.W) << laneElementShift)(8, 0)
@@ -555,8 +856,10 @@ class TmaV2WindowPlanner extends Module {
   // coordinate comparisons and 64-bit address add never share a cycle with
   // clipping, packed-format rounding and byte-run selection.
   val coordinateStage = Module(new Queue(
-    new TmaV2CoordinateMapToken, 1, pipe = true, flow = false))
-  coordinateStage.io.enq.valid := cursorStage.io.deq.valid
+    new TmaV2CoordinateMapToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  coordinateStage.io.flush.foreach(_ := io.flush)
+  coordinateStage.io.enq.valid := cursorStage.io.deq.valid && !io.flush
   cursorStage.io.deq.ready := coordinateStage.io.enq.ready
   coordinateStage.io.enq.bits :=
     0.U.asTypeOf(new TmaV2CoordinateMapToken)
@@ -567,9 +870,16 @@ class TmaV2WindowPlanner extends Module {
   for (lane <- 0 until 8) {
     val laneCoordinate = Wire(Vec(TmaV2Spec.RankMax, SInt(32.W)))
     for (dimension <- 0 until TmaV2Spec.RankMax) {
+      val traversalIndex = if (dimension == 0) {
+        Mux(mappedInterleave32,
+          cursorToken.laneIndex(lane)(dimension) >> 1,
+          cursorToken.laneIndex(lane)(dimension))
+      } else {
+        cursorToken.laneIndex(lane)(dimension)
+      }
       val coordinateWide =
         mappedCommand.coordinates(dimension) +
-          cursorToken.laneIndex(lane)(dimension).zext
+          traversalIndex.zext
       laneCoordinate(dimension) :=
         coordinateWide.asUInt(31, 0).asSInt
     }
@@ -596,8 +906,10 @@ class TmaV2WindowPlanner extends Module {
 
   val coordinateToken = coordinateStage.io.deq.bits
   val globalStage = Module(new Queue(
-    new TmaV2GlobalMapToken, 1, pipe = true, flow = false))
-  globalStage.io.enq.valid := coordinateStage.io.deq.valid
+    new TmaV2GlobalMapToken, 1, pipe = true, flow = false,
+    hasFlush = true))
+  globalStage.io.flush.foreach(_ := io.flush)
+  globalStage.io.enq.valid := coordinateStage.io.deq.valid && !io.flush
   coordinateStage.io.deq.ready := globalStage.io.enq.ready
   globalStage.io.enq.bits :=
     0.U.asTypeOf(new TmaV2GlobalMapToken)
@@ -636,10 +948,14 @@ class TmaV2WindowPlanner extends Module {
     // phase or a nonzero lane offset.
     val packedBytes = (validElements + 1.U) >> 1
 
+    val completeInterleaveAtom = coordinate0 >= 0.S &&
+      coordinate0.asUInt < dim0
     val intervalBytes = Mux(
-      mappedPaddedSubByte,
-      Mux(completePaddedRow, mappedPayloadBytes, 0.U),
-      Mux(mappedPackedFp4, packedBytes, ordinaryBytes))
+      mappedInterleaved,
+      Mux(completeInterleaveAtom, 16.U, 0.U),
+      Mux(mappedPaddedSubByte,
+        Mux(completePaddedRow, mappedPayloadBytes, 0.U),
+        Mux(mappedPackedFp4, packedBytes, ordinaryBytes)))
     val validIntervalBytes = Mux(
       laneValid && outerInBounds, intervalBytes, 0.U)
 
@@ -654,8 +970,10 @@ class TmaV2WindowPlanner extends Module {
 
   val globalToken = globalStage.io.deq.bits
   val laneStage = Module(new Queue(
-    new TmaV2Window, 1, pipe = true, flow = false))
-  laneStage.io.enq.valid := globalStage.io.deq.valid
+    new TmaV2Window, 1, pipe = true, flow = false,
+    hasFlush = true))
+  laneStage.io.flush.foreach(_ := io.flush)
+  laneStage.io.enq.valid := globalStage.io.deq.valid && !io.flush
   globalStage.io.deq.ready := laneStage.io.enq.ready
   laneStage.io.enq.bits := 0.U.asTypeOf(new TmaV2Window)
   laneStage.io.enq.bits.sharedBase :=
@@ -678,9 +996,15 @@ class TmaV2WindowPlanner extends Module {
       (rowWithinWindow << (4.U + mappedCommand.compiled.swizzle)) +
       ((atomWithinRow ^ rowPhase) << 4)
     val logical = (lane * 16).U
+    val interleaveWindowPhase =
+      ((mappedCommand.sharedBase >> 7) +
+        globalToken.logicalWindowIndex) & chunkMask
+    val interleavePhysical =
+      (lane.U ^ interleaveWindowPhase) << 4
     val physical = Mux(
-      mappedCommand.compiled.swizzle === TmaV2Spec.SwizzleNone.U,
-      logical, swizzled)
+      mappedInterleaved, interleavePhysical,
+      Mux(mappedCommand.compiled.swizzle === TmaV2Spec.SwizzleNone.U,
+        logical, swizzled))
     val laneValid = globalToken.lanes(lane).valid
     laneStage.io.enq.bits.lanes(lane).valid := laneValid
     laneStage.io.enq.bits.lanes(lane).globalAddress :=
@@ -692,16 +1016,17 @@ class TmaV2WindowPlanner extends Module {
     // Every supported codec occupies a contiguous prefix of its 16-byte atom,
     // so the lane needs only the prefix length.
     laneStage.io.enq.bits.lanes(lane).sharedBytes := Mux(laneValid,
-      Mux(mappedCommand.copyDirection === TmaV2Spec.DirectionG2S.U,
-        mappedPayloadBytes,
-        Mux(mappedPaddedSubByte, 16.U, mappedPayloadBytes)), 0.U)
+      Mux(mappedInterleaved, 16.U,
+        Mux(mappedCommand.copyDirection === TmaV2Spec.DirectionG2S.U,
+          mappedPayloadBytes,
+          Mux(mappedPaddedSubByte, 16.U, mappedPayloadBytes))), 0.U)
   }
 
-  io.out.valid := laneStage.io.deq.valid
+  io.out.valid := laneStage.io.deq.valid && !io.flush
   io.out.bits := laneStage.io.deq.bits
   laneStage.io.deq.ready := io.out.ready
 
-  io.in.ready := !commandBusy
+  io.in.ready := !commandBusy && !io.flush
   io.produced := cursorStage.io.enq.fire
   io.stalled := laneStage.io.deq.valid && !laneStage.io.deq.ready
 
@@ -709,7 +1034,6 @@ class TmaV2WindowPlanner extends Module {
     command := io.in.bits
     commandDtypeBits := incomingDtypeBits
     commandByteShift := incomingByteShift
-    commandChannelsLog2 := incomingChannelsLog2
     paddedFp4 := incomingPaddedFp4
     paddedFp6 := incomingPaddedFp6
     packedFp4 := incomingPackedFp4
@@ -727,6 +1051,17 @@ class TmaV2WindowPlanner extends Module {
   when(io.out.fire && io.out.bits.last) {
     commandBusy := false.B
     producerDone := false.B
+  }
+  // Flush is kill-dominant. Queue valid bits are cleared by their native
+  // flush inputs on this edge; the command state is cleared here so a later
+  // tensor command can start without waiting for stale planner state.
+  when(io.flush) {
+    commandBusy := false.B
+    producerDone := false.B
+    cursorIndex.foreach(_ := 0.U)
+    componentCursor.foreach(_ := 0.S)
+    cursorRow := 0.U
+    logicalWindowIndex := 0.U
   }
 
   when(!reset.asBool && io.out.fire) {
@@ -771,6 +1106,9 @@ class TmaV2WindowSubsystem(
     TmaV2Spec.cacheSourceEntries(requestEntries, writeAckEntries)
   val io = IO(new Bundle {
     val descriptorInvalidateAll = Input(Bool())
+    val kill = Flipped(Valid(new TmaV2KillRequest))
+    val killAsid = Input(UInt(SV32.asidLen.W))
+    val killPending = Output(Bool())
     val descriptorRequest =
       Flipped(Vec(2, Decoupled(new TmaV2DescriptorRequest)))
     val descriptorResponse =
@@ -787,10 +1125,12 @@ class TmaV2WindowSubsystem(
       Flipped(Decoupled(new TmaV2TlbResponse(requestEntries)))
     val sharedRequest =
       Decoupled(new TmaV2SharedRequest(sharedEntries))
+    val sharedRequestHeld = Input(Bool())
     val sharedResponse =
       Flipped(Decoupled(new TmaV2SharedResponse(sharedEntries)))
     val cacheRequest =
       Decoupled(new TmaV2CacheRequest(cacheSourceEntries))
+    val cacheRequestHeld = Input(Bool())
     val cacheResponse =
       Flipped(Decoupled(new TmaV2CacheResponse(cacheSourceEntries)))
     val completion = Decoupled(new TmaV2EngineCompletion)
@@ -831,6 +1171,11 @@ class TmaV2WindowSubsystem(
   io.descriptorMemoryRequest <> descriptor.io.memoryRequest
   descriptor.io.memoryResponse <> io.descriptorMemoryResponse
   engine.io.command <> io.command
+  engine.io.kill := io.kill
+  engine.io.killAsid := io.killAsid
+  engine.io.cacheRequestHeld := io.cacheRequestHeld
+  engine.io.sharedRequestHeld := io.sharedRequestHeld
+  io.killPending := engine.io.killPending
   engine.io.seal <> io.seal
   engine.io.window <> io.window
   io.tlbRequest <> engine.io.tlbRequest

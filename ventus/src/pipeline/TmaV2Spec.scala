@@ -14,6 +14,7 @@ object TmaV2Spec {
   final val FunctPrefetchTensormap = 5
   final val TensorMapPrefetchSubop = 0
   final val TensorMapInvalidateSubop = 1
+  final val TensorMapInvalidateAllSubop = 2
   final val FunctS2GGroup = 6
   final val FunctMbarrierProxy = 7
   final val S2GGroupCommit = 16
@@ -79,6 +80,7 @@ object TmaV2Spec {
   // migrate a touched page, or recycle the command ASID before completion
   // (including its mbarrier/group acknowledgement) becomes observable.
   final val DefaultDescriptorEntries = 4
+  final val DefaultCommandQueueEntries = 16
   final val BoxDimMax = 256
   final val HeaderWord = 0
   final val ControlWord = 1
@@ -86,10 +88,13 @@ object TmaV2Spec {
   final val GlobalDimsWord = 4
   final val GlobalStridesWord = 9
   final val BoxDimsWord = 17
-  // CUDA-compatible reserved slots.  Ventus requires one for every active
-  // dimension and zero for inactive dimensions; no element-stride datapath
-  // is implemented.
+  // CUDA-compatible traversal strides.  Raw Ventus descriptors require a
+  // value in 1..8 for every active dimension and zero for every inactive
+  // dimension.  Unlike cuTensorMapEncodeTiled, the raw ABI does not silently
+  // canonicalize a non-interleaved dim0 value to one.
   final val ElementStridesWord = 22
+  final val ElementStrideMin = 1
+  final val ElementStrideMax = 8
   final val ReservedWords = 27 until 32
   final val GlobalBaseAlignment = 16
   final val GlobalStrideAlignment = 16

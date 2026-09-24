@@ -54,6 +54,8 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     dut.io.from_l2TLB.bits.paddr.poke(0.U)
     dut.io.perfEnable.poke(false.B)
     dut.io.perfReset.poke(false.B)
+    dut.io.killReq.valid.poke(false.B)
+    dut.io.killReq.bits.asid.poke(0.U)
     dut.clock.step(2)
   }
 
@@ -64,7 +66,8 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
                     reduceMode: Int = TmaV2Spec.ReduceCopy,
                     bulkReduceType: Int = TmaV2Spec.BulkReduceTypeU32,
                     tensorMapSubop: Int =
-                      TmaV2Spec.TensorMapPrefetchSubop): Unit = {
+                      TmaV2Spec.TensorMapPrefetchSubop,
+                    asid: Int = 0): Unit = {
     if (funct == TmaV2Spec.FunctBulkG2S ||
         funct == TmaV2Spec.FunctTensorG2S) {
       pendingReservations.enqueue(Reservation(wid, barrierValid, barrierId))
@@ -90,6 +93,7 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     dut.io.dma_req.bits.ctrl.funct.poke(funct.U)
     dut.io.dma_req.bits.ctrl.wid.poke(wid.U)
     dut.io.dma_req.bits.ctrl.dma_group.poke(group.U)
+    dut.io.dma_req.bits.ctrl.asid.foreach(_.poke(asid.U))
     dut.io.dma_req.valid.poke(true.B)
     var cycles = 0
     while (!dut.io.dma_req.ready.peekBoolean() && cycles < 100) {
@@ -133,27 +137,44 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     port.compiled.oobFill.poke(((control >> 18) & 0x1) != 0)
     port.compiled.globalBase.poke(
       words(2).U)
+    port.compiled.rawDim0Box.poke(words(17).U)
     var logicalBytes = BigInt(0)
     for (dimension <- 0 until TmaV2Spec.RankMax) {
       val globalDim = if (words(4 + dimension) == 0)
         BigInt(1) << 32 else words(4 + dimension)
+      val rawElementStride = words(22 + dimension)
+      val elementStride =
+        if (dimension < rank && rawElementStride >= 1 && rawElementStride <= 8)
+          rawElementStride else BigInt(1)
+      val effectiveBox =
+        if (dimension < rank)
+          (words(17 + dimension) + elementStride - 1) / elementStride
+        else BigInt(0)
       port.compiled.globalDims(dimension).poke(globalDim.U)
-      port.compiled.boxDims(dimension).poke(words(17 + dimension).U)
+      port.compiled.boxDims(dimension).poke(effectiveBox.U)
+      port.compiled.strideMinus1(dimension).poke(
+        (if (dimension < rank) elementStride - 1 else BigInt(0)).U)
       if (dimension < TmaV2Spec.RankMax - 1) {
         val stride = (words(10 + dimension * 2) << 32) |
           words(9 + dimension * 2)
         port.compiled.globalStrides(dimension).poke(stride.U)
       }
     }
+    val dim0Stride = if (words(22) >= 1 && words(22) <= 8)
+      words(22) else BigInt(1)
+    val effectiveDim0 = (words(17) + dim0Stride - 1) / dim0Stride
     val rowBytes = dtypeBits match {
-      case 4 => (words(17) + 1) / 2
-      case 6 => (words(17) * 6 + 7) / 8
-      case bits if bits > 0 => words(17) * bits / 8
+      case 4 => (effectiveDim0 + 1) / 2
+      case 6 => (effectiveDim0 * 6 + 7) / 8
+      case bits if bits > 0 => effectiveDim0 * bits / 8
       case _ => BigInt(0)
     }
     logicalBytes = rowBytes
-    for (dimension <- 1 until rank)
-      logicalBytes *= words(17 + dimension)
+    for (dimension <- 1 until rank) {
+      val step = if (words(22 + dimension) >= 1 &&
+          words(22 + dimension) <= 8) words(22 + dimension) else BigInt(1)
+      logicalBytes *= (words(17 + dimension) + step - 1) / step
+    }
     port.compiled.logicalBytes.poke(logicalBytes.U)
     val sliceStride =
       if (interleave != TmaV2Spec.InterleaveNone && rank >= 3) {
@@ -300,7 +321,7 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     }
     if (cycles >= limit) {
       println(s"TMA_V2_TIMEOUT ingressState=${dut.ingress.state.peekInt()} " +
-        s"tensorEmit=${dut.ingress.tensorEmitActive.peekBoolean()} " +
+        s"tensorEmit=${dut.execute.tensorEmitActive.peekBoolean()} " +
         s"tlbBusy=${dut.tlbBusy.peekBoolean()} descriptorNeedCache=${dut.descriptorNeedCache.peekBoolean()} " +
         s"descriptorCacheWait=${dut.descriptorCacheWait.peekBoolean()} " +
         s"commandValid=${dut.subsystem.engine.commandValid.peekBoolean()} " +
@@ -661,7 +682,7 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
-  "physical core rejects a non-unit element-stride placeholder" in {
+  "physical core executes an outer element stride with dense shared packing" in {
     test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
       initialize(dut)
       val descriptor = Array.fill[BigInt](32)(0)
@@ -687,14 +708,15 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
         })
 
       assert(done == Seq(
-        Completion(3, 0, s2g = false, barrierValid = false, 0, 0)))
-      assert(opcodes == Seq(4),
-        s"unsupported descriptor must stop after one descriptor read: $opcodes")
-      assert(payloadAddresses.isEmpty)
-      assert(reads == 0 && writes == 0)
-      assert(statuses == Seq((
-        BigInt(TmaV2Spec.StatusUnsupportedFeature),
-        TmaV2Status.UnsupportedFeature.litValue)))
+        Completion(3, 0, s2g = false, barrierValid = true, 2, 4096)))
+      assert(opcodes.count(_ == 4) == 33,
+        s"descriptor plus 32 strided source lines were expected: $opcodes")
+      val expectedAddresses = (0 until 32).map(index =>
+        BigInt(0x1000 + index * 256))
+      assert(payloadAddresses == expectedAddresses,
+        s"outer stride addresses were $payloadAddresses")
+      assert(reads == 0 && writes == 32)
+      assert(statuses.isEmpty)
     }
   }
 
@@ -720,7 +742,7 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
 
       issue(dut, TmaV2Spec.FunctTensorG2S, wid = 3,
         in1 = 0x4000, in2 = Seq.fill(5)(0), in3 = 0x2000,
-        barrierValid = true, barrierId = 2, transactionBytes = 192)
+        barrierValid = true, barrierId = 2, transactionBytes = 256)
       val (done, _, reads, writes, statuses, _) = serviceMany(
         dut, descriptor.toSeq, expectedCompletions = 1, limit = 5000,
         observeCacheRequest = (_, _, address, _, _) => {
@@ -729,16 +751,17 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
 
       assert(done.size == 1 && !done.head.s2g)
       assert(done.head.barrierValid && done.head.barrierId == 2 &&
-        done.head.bytes == 192,
-        s"interleave16 must account the full 192B logical payload: ${done.head}")
+        done.head.bytes == 256,
+        s"interleave16 must account eight 16B atoms in each of two slices: " +
+          s"${done.head}")
       assert(payloadAddresses.distinct.size == 3,
         s"interleave16 expected three unique payload lines, saw " +
           payloadAddresses.map(_.toString(16)))
       assert(payloadAddresses.size == 3,
         s"interleave16 duplicated payload lines: " +
           payloadAddresses.map(_.toString(16)))
-      assert(reads == 0 && writes == 5,
-        "three cache lines feed five partial line-consumer writes")
+      assert(reads == 0 && writes == 3,
+        "corrected channel-metadata traversal consumes each cache line once")
       assert(statuses.isEmpty)
     }
   }
@@ -771,6 +794,63 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
         "prefetch after targeted invalidation must issue a fresh 128B Get")
       assert(writes == 1)
       assert(refillStatus.isEmpty)
+    }
+  }
+
+  "physical core invalidates every local TensorMap without an address operand" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      issue(dut, TmaV2Spec.FunctTensorG2S, wid = 1,
+        in1 = 0x4000, in2 = Seq.fill(5)(0), in3 = 0x2000)
+      val (_, firstOpcodes, _, _, firstStatus, _) =
+        serviceMany(dut, descriptorWords(), expectedCompletions = 1)
+      assert(firstOpcodes.count(_ == 4) == 2,
+        "first tensor command must fetch descriptor and payload")
+      assert(firstStatus.isEmpty)
+
+      // IVALL has no address operand; an intentionally unaligned x-register
+      // value must not be interpreted as a descriptor address.
+      issue(dut, TmaV2Spec.FunctPrefetchTensormap, wid = 1,
+        in1 = 3, in2 = Seq.empty, in3 = 0,
+        tensorMapSubop = TmaV2Spec.TensorMapInvalidateAllSubop)
+      val (invalidateDone, invalidateOpcodes, _, _, invalidateStatus, _) =
+        serviceMany(dut, expectedCompletions = 1)
+      assert(invalidateDone.size == 1)
+      assert(invalidateOpcodes.isEmpty)
+      assert(invalidateStatus.isEmpty)
+
+      issue(dut, TmaV2Spec.FunctTensorG2S, wid = 1,
+        in1 = 0x4000, in2 = Seq.fill(5)(0), in3 = 0x2200)
+      val (_, secondOpcodes, _, _, secondStatus, _) =
+        serviceMany(dut, descriptorWords(), expectedCompletions = 1)
+      assert(secondOpcodes.count(_ == 4) == 2,
+        "IVALL must force the next tensor demand to refill its descriptor")
+      assert(secondStatus.isEmpty)
+    }
+  }
+
+  "negative Tensor S2G coordinates stop after descriptor validation" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      for ((mode, index) <- Seq(
+          TmaV2Spec.ReduceCopy, TmaV2Spec.ReduceAdd).zipWithIndex) {
+        initialize(dut)
+        val requests = mutable.ArrayBuffer.empty[(Int, BigInt)]
+        issue(dut, TmaV2Spec.FunctTensorS2G, wid = index + 1,
+          in1 = 0x4000, in2 = Seq(-1, 0, 0, 0, 0), in3 = 0x2000,
+          reduceMode = mode)
+        val (done, _, reads, writes, statuses, _) = serviceMany(
+          dut, descriptorWords(), expectedCompletions = 1,
+          observeCacheRequest = (opcode, _, address, _, _) =>
+            requests += ((opcode, address)))
+        assert(done.size == 1)
+        assert(requests.forall(_ == (4, BigInt(0x4000))) && requests.size <= 1,
+          s"negative Tensor S2G mode=$mode issued payload traffic: $requests")
+        assert(reads == 0 && writes == 0)
+        assert(statuses.exists { case (code, detail) =>
+          code == TmaV2Spec.StatusInvalidDescriptor &&
+            detail == TmaV2Status.BadCoordinate.litValue
+        }, s"negative Tensor S2G mode=$mode statuses=$statuses")
+      }
     }
   }
 
@@ -827,6 +907,64 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
+  "physical core reduces compacted interleave16 stride atoms" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      val descriptor = Array.fill[BigInt](32)(0)
+      descriptor(0) = TmaV2Spec.DescriptorMagic
+      descriptor(1) = TmaV2Spec.DTypeU32 | (3 << 5) |
+        (TmaV2Spec.Interleave16 << 8)
+      descriptor(2) = 0x1000
+      descriptor(4) = 8
+      descriptor(5) = 4
+      descriptor(6) = 1
+      descriptor(9) = 128
+      descriptor(11) = 512
+      descriptor(17) = 8
+      descriptor(18) = 4
+      descriptor(19) = 1
+      descriptor(22) = 3
+      descriptor(23) = 1
+      descriptor(24) = 1
+
+      val cacheRequests = mutable.ArrayBuffer.empty[
+        (Int, Int, BigInt, Seq[BigInt], Seq[BigInt])]
+      issue(dut, TmaV2Spec.FunctTensorS2G, wid = 4,
+        in1 = 0x4000, in2 = Seq.fill(5)(0), in3 = 0x2000, group = 1,
+        reduceMode = TmaV2Spec.ReduceAdd)
+      val (done, _, reads, writes, statuses, _) = serviceMany(
+        dut, descriptor.toSeq, expectedCompletions = 1, limit = 5000,
+        observeCacheRequest = (opcode, param, address, data, mask) =>
+          cacheRequests += ((opcode, param, address, data, mask)))
+
+      assert(done == Seq(
+        Completion(4, 1, s2g = true, barrierValid = false, 0, 0)))
+      val elementRequests = cacheRequests.filter(_._3 == 0x1000)
+      assert(elementRequests.size == 12,
+        s"three selected 16B atoms must issue 12 U32 AMOs, saw " +
+          elementRequests.size)
+      assert(elementRequests.forall(request => request._1 == 2 && request._2 == 4),
+        s"interleave reduction did not use arithmetic-add AMOs: $elementRequests")
+
+      val expectedTargetWords =
+        Seq(0, 1, 2, 3, 12, 13, 14, 15, 24, 25, 26, 27)
+      val requestsByTarget = elementRequests.sortBy(request =>
+        request._5.indexWhere(_ != 0))
+      requestsByTarget.zip(expectedTargetWords).zipWithIndex.foreach {
+        case ((request, targetWord), denseWord) =>
+          assert(request._5.count(_ != 0) == 1 &&
+            request._5(targetWord) == 0xf,
+            s"target word $targetWord AMO mask was ${request._5}")
+          assert(request._4(targetWord) == BigInt(0x20000000L + denseWord),
+            s"target word $targetWord operand was " +
+              s"0x${request._4(targetWord).toString(16)}")
+      }
+      assert(reads == 1 && writes == 0,
+        "the three densely packed atoms must use one shared-memory read")
+      assert(statuses.isEmpty)
+    }
+  }
+
   "physical core completes tensor G2S before accepting bulk S2G" in {
     test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
       initialize(dut)
@@ -873,22 +1011,726 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
-  "ingress accepts one lookahead and blocks the third data command" in {
-    test(new TmaV2Ingress).withAnnotations(Seq(CachingAnnotation)) { dut =>
-      dut.io.in.valid.poke(false.B)
-      dut.io.command.ready.poke(true.B)
-      dut.io.window.ready.poke(false.B)
-      dut.io.seal.ready.poke(true.B)
-      dut.io.directCompletion.ready.poke(true.B)
-      dut.io.engineCompletion.valid.poke(false.B)
-      dut.io.engineCompletion.bits.wid.poke(0.U)
-      dut.io.engineCompletion.bits.copyDirection.poke(0.U)
-      dut.io.engineCompletion.bits.group.poke(0.U)
-      dut.io.engineCompletion.bits.barrierValid.poke(false.B)
-      dut.io.engineCompletion.bits.barrierId.poke(0.U)
-      dut.io.engineCompletion.bits.barrierGeneration.poke(0.U)
-      dut.io.engineCompletion.bits.transactionBytes.poke(0.U)
+  "ASID kill cancels an active command and every queued command exactly once" in {
+    test(new TmaV2DmaCore(windowEntries = 4, requestEntries = 4,
+      sharedEntries = 4, writeAckEntries = 8, commandEntries = 4))
+      .withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      dut.io.shared_req.ready.poke(false.B)
+      dut.io.dma_cache_req.ready.poke(false.B)
+      for (wid <- 0 until 3) {
+        issue(dut, TmaV2Spec.FunctBulkS2G, wid = wid,
+          in1 = 0x2000 + wid * 0x100, in2 = Seq(16),
+          in3 = 0x1000 + wid * 0x100, group = wid)
+      }
+
+      var waitActive = 0
+      while (!dut.io.shared_req.valid.peekBoolean() && waitActive < 80) {
+        dut.clock.step()
+        waitActive += 1
+      }
+      assert(waitActive < 80)
+      val heldSharedSource = dut.io.shared_req.bits.instrId.peekInt()
+      val heldSharedWrite = dut.io.shared_req.bits.isWrite.peekBoolean()
+      val heldSharedSet = dut.io.shared_req.bits.setIdx.peekInt()
+      val heldSharedActive = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.perLaneAddr(lane).activeMask.peekBoolean())
+      val heldSharedBlocks = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.perLaneAddr(lane).blockOffset.peekInt())
+      val heldSharedMasks = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.perLaneAddr(lane).wordOffset1H.peekInt())
+      val heldSharedData = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.data(lane).peekInt())
+      def expectHeldShared(): Unit = {
+        dut.io.shared_req.valid.expect(true.B)
+        dut.io.shared_req.bits.instrId.expect(heldSharedSource.U)
+        dut.io.shared_req.bits.isWrite.expect(heldSharedWrite.B)
+        dut.io.shared_req.bits.setIdx.expect(heldSharedSet.U)
+        for (lane <- 0 until num_thread) {
+          dut.io.shared_req.bits.perLaneAddr(lane).activeMask.expect(
+            heldSharedActive(lane).B)
+          dut.io.shared_req.bits.perLaneAddr(lane).blockOffset.expect(
+            heldSharedBlocks(lane).U)
+          dut.io.shared_req.bits.perLaneAddr(lane).wordOffset1H.expect(
+            heldSharedMasks(lane).U)
+          dut.io.shared_req.bits.data(lane).expect(heldSharedData(lane).U)
+        }
+      }
+      // Make the request externally irrevocable before accepting kill.
+      dut.clock.step()
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.io.killReq.ready.expect(true.B)
+      expectHeldShared()
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+
+      var completions = Vector.empty[(BigInt, BigInt)]
+      def sampleCompletion(): Unit = {
+        if (dut.io.tma_completion.valid.peekBoolean())
+          completions :+= (
+            dut.io.tma_completion.bits.wid.peekInt(),
+            dut.io.tma_completion.bits.group.peekInt())
+      }
+      // valid and every payload bit must remain stable while the external
+      // sink is stalled, even though the owning command is now killed.
+      for (_ <- 0 until 3) {
+        expectHeldShared()
+        dut.io.killDone.valid.expect(false.B)
+        sampleCompletion()
+        dut.clock.step()
+      }
+      dut.io.shared_req.ready.poke(true.B)
+      expectHeldShared()
+      sampleCompletion()
+      dut.clock.step()
+      dut.io.shared_req.ready.poke(false.B)
+      dut.io.shared_req.valid.expect(false.B)
+
+      // The irrevocable read owns its response after the delayed request
+      // handshake.  Drain that response; kill must discard its data rather
+      // than creating a new cache request.
+      dut.io.shared_rsp.bits.instrId.poke(heldSharedSource.U)
+      dut.io.shared_rsp.bits.isWrite.poke(false.B)
+      dut.io.shared_rsp.bits.isMBarrier.poke(false.B)
+      for (lane <- 0 until num_thread) {
+        dut.io.shared_rsp.bits.data(lane).poke((0x300 + lane).U)
+        dut.io.shared_rsp.bits.activeMask(lane).poke(
+          heldSharedActive(lane).B)
+      }
+      dut.io.shared_rsp.valid.poke(true.B)
+      var responseWait = 0
+      while (!dut.io.shared_rsp.ready.peekBoolean() && responseWait < 20) {
+        sampleCompletion()
+        dut.clock.step()
+        responseWait += 1
+      }
+      assert(responseWait < 20)
+      sampleCompletion()
+      dut.clock.step()
+      dut.io.shared_rsp.valid.poke(false.B)
+
+      var sawDone = false
+      var cycles = 0
+      while (!sawDone && cycles < 120) {
+        assert(!dut.io.shared_req.valid.peekBoolean(),
+          "killed command emitted a new shared request")
+        assert(!dut.io.dma_cache_req.valid.peekBoolean(),
+          "killed command emitted a new cache request")
+        sampleCompletion()
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone, "queued/active TMA kill did not drain")
+      assert(completions.sorted == Vector((BigInt(0), BigInt(0)),
+        (BigInt(1), BigInt(1)), (BigInt(2), BigInt(2))))
+    }
+  }
+
+  "ASID kill wins over a same-cycle idle-Prepare dequeue" in {
+    test(new TmaV2DmaCore(windowEntries = 4, requestEntries = 4,
+      sharedEntries = 4, writeAckEntries = 8, commandEntries = 1))
+      .withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+
+      // issue() returns on the enqueue edge.  The following cycle therefore
+      // has a resident FIFO head and an idle, ready Prepare stage.
+      issue(dut, TmaV2Spec.FunctBulkG2S, wid = 6,
+        in1 = 0x1000, in2 = Seq(128), in3 = 0x2000,
+        group = 2, asid = 0)
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.io.killReq.ready.expect(true.B)
+      dut.io.txReserve.valid.expect(false.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+
+      var completion: Option[Completion] = None
+      var sawDone = false
+      var cycles = 0
+      while (!sawDone && cycles < 40) {
+        assert(!dut.io.txReserve.valid.peekBoolean(),
+          "same-cycle killed head escaped into Prepare reservation")
+        assert(!dut.io.dma_cache_req.valid.peekBoolean(),
+          "same-cycle killed head issued descriptor or payload traffic")
+        assert(!dut.io.shared_req.valid.peekBoolean(),
+          "same-cycle killed head issued shared-memory traffic")
+        if (dut.io.tma_completion.valid.peekBoolean()) {
+          assert(completion.isEmpty, "killed queued command completed twice")
+          completion = Some(Completion(
+            dut.io.tma_completion.bits.wid.peekInt(),
+            dut.io.tma_completion.bits.group.peekInt(),
+            dut.io.tma_completion.bits.is_s2g.peekBoolean(),
+            dut.io.tma_completion.bits.barrierValid.peekBoolean(),
+            dut.io.tma_completion.bits.barrierId.peekInt(),
+            dut.io.tma_completion.bits.transactionBytes.peekInt()))
+        }
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+
+      assert(sawDone, "same-cycle queued kill did not drain")
+      assert(completion.contains(Completion(6, 2, s2g = false,
+        barrierValid = false, barrierId = 0, bytes = 0)))
+    }
+  }
+
+  "active tensor kill flushes a backpressured planner and the next tensor recovers" in {
+    test(new TmaV2DmaCore(windowEntries = 2, requestEntries = 4,
+      sharedEntries = 4, writeAckEntries = 8, commandEntries = 2))
+      .withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+
+      val longDescriptor = Array.fill[BigInt](32)(0)
+      longDescriptor(0) = TmaV2Spec.DescriptorMagic
+      longDescriptor(1) = TmaV2Spec.DTypeU8 | (2 << 5)
+      longDescriptor(2) = 0x1000
+      longDescriptor(4) = 256
+      longDescriptor(5) = 128
+      longDescriptor(9) = 256
+      longDescriptor(17) = 256
+      longDescriptor(18) = 128
+      longDescriptor(22) = 1
+      longDescriptor(23) = 1
+
+      // Populate the descriptor cache first so the command reaches Execute
+      // without a descriptor-transport dependency during the kill scenario.
+      issue(dut, TmaV2Spec.FunctPrefetchTensormap, wid = 1,
+        in1 = 0x4000, in2 = Seq.empty, in3 = 0,
+        tensorMapSubop = TmaV2Spec.TensorMapPrefetchSubop)
+      val (prefetchDone, _, _, _, prefetchStatus, _) = serviceMany(
+        dut, longDescriptor.toSeq, expectedCompletions = 1, limit = 1000)
+      assert(prefetchDone.size == 1 && prefetchStatus.isEmpty)
+      // serviceMany may leave the just-consumed producer payload driven for
+      // its final sampled cycle; manual stepping below must not replay it.
+      dut.io.from_l2TLB.valid.poke(false.B)
+      dut.io.dma_cache_rsp.valid.poke(false.B)
+      dut.io.shared_rsp.valid.poke(false.B)
+      dut.io.txReserveResponse.valid.poke(false.B)
+
+      dut.io.dma_cache_req.ready.poke(false.B)
+      dut.io.shared_req.ready.poke(false.B)
+      issue(dut, TmaV2Spec.FunctTensorG2S, wid = 5,
+        in1 = 0x4000, in2 = Seq(0, 0), in3 = 0x2000,
+        group = 3)
+
+      var plannerBackpressured = false
+      var cycles = 0
+      while (!plannerBackpressured && cycles < 200) {
+        dut.io.txReserveResponse.valid.poke(pendingReservations.nonEmpty.B)
+        if (pendingReservations.nonEmpty) {
+          val reservation = pendingReservations.front
+          dut.io.txReserveResponse.bits.wid.poke(reservation.wid.U)
+          dut.io.txReserveResponse.bits.accepted.poke(true.B)
+          dut.io.txReserveResponse.bits.barrierValid.poke(false.B)
+          dut.io.txReserveResponse.bits.barrierId.poke(0.U)
+          dut.io.txReserveResponse.bits.generation.poke(0.U)
+        }
+        val reserveFire = pendingReservations.nonEmpty &&
+          dut.io.txReserveResponse.ready.peekBoolean()
+        plannerBackpressured = dut.io.dma_cache_req.valid.peekBoolean() &&
+          !dut.io.dma_cache_req.ready.peekBoolean()
+        dut.clock.step()
+        if (reserveFire) pendingReservations.dequeue()
+        cycles += 1
+      }
+      assert(plannerBackpressured,
+        "long tensor never reached the stalled cache/engine boundary")
+      // Leave the cache stalled long enough to fill both engine window slots
+      // and propagate backpressure through every elastic planner stage.
+      dut.clock.step(16)
+      dut.io.txReserveResponse.valid.poke(false.B)
+      val heldCacheOpcode = dut.io.dma_cache_req.bits.a_opcode.peekInt()
+      val heldCacheParam = dut.io.dma_cache_req.bits.a_param.peekInt()
+      val heldCacheSource = dut.io.dma_cache_req.bits.a_source.peekInt()
+      val heldCacheAddress = dut.io.dma_cache_req.bits.a_addr.get.peekInt()
+      val heldCacheData = (0 until dcache_BlockWords).map(word =>
+        dut.io.dma_cache_req.bits.a_data(word).peekInt())
+      val heldCacheMasks = (0 until dcache_BlockWords).map(word =>
+        dut.io.dma_cache_req.bits.a_mask(word).peekInt())
+      def expectHeldCache(): Unit = {
+        dut.io.dma_cache_req.valid.expect(true.B)
+        dut.io.dma_cache_req.bits.a_opcode.expect(heldCacheOpcode.U)
+        dut.io.dma_cache_req.bits.a_param.expect(heldCacheParam.U)
+        dut.io.dma_cache_req.bits.a_source.expect(heldCacheSource.U)
+        dut.io.dma_cache_req.bits.a_addr.get.expect(heldCacheAddress.U)
+        for (word <- 0 until dcache_BlockWords) {
+          dut.io.dma_cache_req.bits.a_data(word).expect(heldCacheData(word).U)
+          dut.io.dma_cache_req.bits.a_mask(word).expect(heldCacheMasks(word).U)
+        }
+      }
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.io.killReq.ready.expect(true.B)
+      expectHeldCache()
+      dut.io.shared_req.valid.expect(false.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+
+      var killedCompletions = Vector.empty[Completion]
+      def sampleKilledCompletion(): Unit = {
+        if (dut.io.tma_completion.valid.peekBoolean()) {
+          killedCompletions :+= Completion(
+            dut.io.tma_completion.bits.wid.peekInt(),
+            dut.io.tma_completion.bits.group.peekInt(),
+            dut.io.tma_completion.bits.is_s2g.peekBoolean(),
+            dut.io.tma_completion.bits.barrierValid.peekBoolean(),
+            dut.io.tma_completion.bits.barrierId.peekInt(),
+            dut.io.tma_completion.bits.transactionBytes.peekInt())
+        }
+      }
+      for (_ <- 0 until 3) {
+        expectHeldCache()
+        dut.io.killDone.valid.expect(false.B)
+        sampleKilledCompletion()
+        dut.clock.step()
+      }
+      // Only the request which was already visible before kill may cross the
+      // boundary.  Its response is drained and discarded by kill mode.
+      dut.io.dma_cache_req.ready.poke(true.B)
+      expectHeldCache()
+      sampleKilledCompletion()
+      dut.clock.step()
+      dut.io.dma_cache_req.ready.poke(false.B)
+      dut.io.dma_cache_req.valid.expect(false.B)
+
+      dut.io.dma_cache_rsp.bits.d_opcode.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_param.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_source.poke(heldCacheSource.U)
+      dut.io.dma_cache_rsp.bits.d_data.foreach(_.poke(0.U))
+      dut.io.dma_cache_rsp.valid.poke(true.B)
+      var responseWait = 0
+      while (!dut.io.dma_cache_rsp.ready.peekBoolean() && responseWait < 20) {
+        sampleKilledCompletion()
+        dut.clock.step()
+        responseWait += 1
+      }
+      assert(responseWait < 20)
+      sampleKilledCompletion()
+      dut.clock.step()
+      dut.io.dma_cache_rsp.valid.poke(false.B)
+
+      var sawDone = false
+      cycles = 0
+      while (!sawDone && cycles < 120) {
+        assert(!dut.io.dma_cache_req.valid.peekBoolean(),
+          "killed tensor issued a new cache request")
+        assert(!dut.io.shared_req.valid.peekBoolean(),
+          "killed tensor issued a new shared request")
+        sampleKilledCompletion()
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone, "active tensor kill did not drain")
+      assert(killedCompletions == Vector(
+        Completion(5, 3, s2g = false, barrierValid = false, 0, 0)))
+
+      // A stale token in any planner queue used to leave in.ready low
+      // permanently.  Complete a fresh tensor to prove post-kill recovery.
+      dut.io.dma_cache_req.ready.poke(true.B)
+      dut.io.shared_req.ready.poke(true.B)
+      issue(dut, TmaV2Spec.FunctTensorG2S, wid = 7,
+        in1 = 0x5000, in2 = Seq.fill(5)(0), in3 = 0x3000,
+        group = 1)
+      val (recovered, _, _, recoveredWrites, recoveredStatus, _) =
+        serviceMany(dut, descriptorWords(), expectedCompletions = 1,
+          limit = 1000)
+      assert(recovered == Seq(
+        Completion(7, 1, s2g = false, barrierValid = false, 0, 0)))
+      assert(recoveredWrites == 1 && recoveredStatus.isEmpty)
+    }
+  }
+
+  "ASID kill drains an outstanding Prepare descriptor refill" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      issue(dut, TmaV2Spec.FunctTensorS2G, wid = 3,
+        in1 = 0x4000, in2 = Seq.fill(5)(0), in3 = 0x2000,
+        group = 1)
+
+      var pendingTlb: Option[BigInt] = None
+      var descriptorSource: Option[BigInt] = None
+      var cycles = 0
+      while (descriptorSource.isEmpty && cycles < 100) {
+        dut.io.from_l2TLB.valid.poke(pendingTlb.nonEmpty.B)
+        pendingTlb.foreach(address =>
+          dut.io.from_l2TLB.bits.paddr.poke(address.U))
+        val tlbFire = dut.io.to_l2TLB.valid.peekBoolean()
+        val tlbAddress = if (tlbFire)
+          Some(dut.io.to_l2TLB.bits.vaddr.peekInt()) else None
+        val tlbRspFire = pendingTlb.nonEmpty &&
+          dut.io.from_l2TLB.ready.peekBoolean()
+        if (dut.io.dma_cache_req.valid.peekBoolean()) {
+          dut.io.dma_cache_req.bits.a_opcode.expect(4.U)
+          dut.io.dma_cache_req.bits.a_addr.get.expect(0x4000.U)
+          descriptorSource = Some(
+            dut.io.dma_cache_req.bits.a_source.peekInt())
+        }
+        dut.clock.step()
+        if (tlbRspFire) pendingTlb = None
+        if (tlbFire) pendingTlb = tlbAddress
+        cycles += 1
+      }
+      assert(descriptorSource.nonEmpty)
+      dut.io.from_l2TLB.valid.poke(false.B)
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+      dut.clock.step(4)
+      dut.io.killDone.valid.expect(false.B)
+      assert(!dut.io.shared_req.valid.peekBoolean())
+
+      val words = descriptorWords()
+      dut.io.dma_cache_rsp.bits.d_opcode.poke(1.U)
+      dut.io.dma_cache_rsp.bits.d_param.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_source.poke(descriptorSource.get.U)
+      for (word <- 0 until dcache_BlockWords)
+        dut.io.dma_cache_rsp.bits.d_data(word).poke(words(word).U)
+      dut.io.dma_cache_rsp.valid.poke(true.B)
+      while (!dut.io.dma_cache_rsp.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.dma_cache_rsp.valid.poke(false.B)
+
+      var completions = 0
+      var sawDone = false
+      cycles = 0
+      while (!sawDone && cycles < 100) {
+        if (dut.io.tma_completion.valid.peekBoolean()) completions += 1
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        assert(!dut.io.shared_req.valid.peekBoolean())
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone && completions == 1)
+    }
+  }
+
+  "stalled Prepare reservation is stable across kill and then drains to barrier cleanup" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      dut.io.txReserve.ready.poke(false.B)
+      issue(dut, TmaV2Spec.FunctBulkG2S, wid = 5,
+        in1 = 0x1000, in2 = Seq(64), in3 = 0x2000,
+        barrierValid = true, barrierId = 2)
+      var cycles = 0
+      while (!dut.io.txReserve.valid.peekBoolean() && cycles < 60) {
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(cycles < 60, "Prepare did not present the G2S reservation")
+      dut.io.txReserve.bits.wid.expect(5.U)
+      dut.io.txReserve.bits.bytes.expect(64.U)
+      // Cross one stalled edge so the top-level irrevocable marker owns this
+      // exact payload before kill arrives.
+      dut.clock.step()
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.io.txReserve.valid.expect(true.B)
+      dut.io.txReserve.bits.wid.expect(5.U)
+      dut.io.txReserve.bits.bytes.expect(64.U)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+      for (_ <- 0 until 3) {
+        dut.io.txReserve.valid.expect(true.B)
+        dut.io.txReserve.bits.wid.expect(5.U)
+        dut.io.txReserve.bits.bytes.expect(64.U)
+        dut.io.killDone.valid.expect(false.B)
+        dut.clock.step()
+      }
+
+      // The pre-kill presented beat is allowed to complete exactly once.
       dut.io.txReserve.ready.poke(true.B)
+      dut.io.txReserve.valid.expect(true.B)
+      dut.clock.step()
+      dut.io.txReserve.ready.poke(false.B)
+      dut.io.txReserve.valid.expect(false.B)
+      dut.io.killDone.valid.expect(false.B)
+
+      dut.io.txReserveResponse.bits.wid.poke(5.U)
+      dut.io.txReserveResponse.bits.accepted.poke(true.B)
+      dut.io.txReserveResponse.bits.barrierValid.poke(true.B)
+      dut.io.txReserveResponse.bits.barrierId.poke(2.U)
+      dut.io.txReserveResponse.bits.generation.poke(7.U)
+      dut.io.txReserveResponse.valid.poke(true.B)
+      while (!dut.io.txReserveResponse.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.txReserveResponse.valid.poke(false.B)
+
+      var completion: Option[Completion] = None
+      var sawDone = false
+      cycles = 0
+      while (!sawDone && cycles < 80) {
+        if (dut.io.tma_completion.valid.peekBoolean()) {
+          completion = Some(Completion(
+            dut.io.tma_completion.bits.wid.peekInt(),
+            dut.io.tma_completion.bits.group.peekInt(),
+            dut.io.tma_completion.bits.is_s2g.peekBoolean(),
+            dut.io.tma_completion.bits.barrierValid.peekBoolean(),
+            dut.io.tma_completion.bits.barrierId.peekInt(),
+            dut.io.tma_completion.bits.transactionBytes.peekInt()))
+        }
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        assert(!dut.io.dma_cache_req.valid.peekBoolean())
+        assert(!dut.io.shared_req.valid.peekBoolean())
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone)
+      assert(completion.contains(Completion(5, 0, s2g = false,
+        barrierValid = true, barrierId = 2, bytes = 64)))
+    }
+  }
+
+  "ASID kill drains an accepted shared read and drops its returned payload" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      issue(dut, TmaV2Spec.FunctBulkS2G, wid = 2,
+        in1 = 0x2000, in2 = Seq(16), in3 = 0x1000, group = 2)
+
+      var waitShared = 0
+      while (!dut.io.shared_req.valid.peekBoolean() && waitShared < 80) {
+        dut.clock.step()
+        waitShared += 1
+      }
+      assert(waitShared < 80)
+      val source = dut.io.shared_req.bits.instrId.peekInt()
+      val active = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.perLaneAddr(lane).activeMask.peekBoolean())
+      dut.clock.step() // shared request fires
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+      dut.io.killDone.valid.expect(false.B)
+
+      dut.io.shared_rsp.bits.instrId.poke(source.U)
+      dut.io.shared_rsp.bits.isWrite.poke(false.B)
+      dut.io.shared_rsp.bits.isMBarrier.poke(false.B)
+      for (lane <- 0 until num_thread) {
+        dut.io.shared_rsp.bits.data(lane).poke((0x100 + lane).U)
+        dut.io.shared_rsp.bits.activeMask(lane).poke(active(lane).B)
+      }
+      dut.io.shared_rsp.valid.poke(true.B)
+      var waitResponse = 0
+      while (!dut.io.shared_rsp.ready.peekBoolean() && waitResponse < 20) {
+        dut.clock.step()
+        waitResponse += 1
+      }
+      assert(waitResponse < 20)
+      dut.clock.step()
+      dut.io.shared_rsp.valid.poke(false.B)
+
+      var completions = 0
+      var sawDone = false
+      var cycles = 0
+      while (!sawDone && cycles < 80) {
+        assert(!dut.io.dma_cache_req.valid.peekBoolean(),
+          "shared payload returned after kill must not become a Put/AMO")
+        if (dut.io.tma_completion.valid.peekBoolean()) completions += 1
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone && completions == 1)
+    }
+  }
+
+  "ASID kill drains an accepted cache Get and drops its returned payload" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      issue(dut, TmaV2Spec.FunctBulkG2S, wid = 3,
+        in1 = 0x1000, in2 = Seq(16), in3 = 0x2000,
+        barrierValid = true, barrierId = 1)
+
+      // Complete the existing transaction-reservation handshake.
+      var waitReserve = 0
+      while (!dut.io.txReserve.valid.peekBoolean() && waitReserve < 40) {
+        dut.clock.step()
+        waitReserve += 1
+      }
+      assert(waitReserve < 40)
+      dut.clock.step()
+      dut.io.txReserveResponse.bits.wid.poke(3.U)
+      dut.io.txReserveResponse.bits.accepted.poke(true.B)
+      dut.io.txReserveResponse.bits.barrierValid.poke(true.B)
+      dut.io.txReserveResponse.bits.barrierId.poke(1.U)
+      dut.io.txReserveResponse.bits.generation.poke(0.U)
+      dut.io.txReserveResponse.valid.poke(true.B)
+      while (!dut.io.txReserveResponse.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.txReserveResponse.valid.poke(false.B)
+
+      var pendingTlb: Option[BigInt] = None
+      var cacheSource: Option[BigInt] = None
+      var cycles = 0
+      while (cacheSource.isEmpty && cycles < 100) {
+        dut.io.from_l2TLB.valid.poke(pendingTlb.nonEmpty.B)
+        pendingTlb.foreach(address =>
+          dut.io.from_l2TLB.bits.paddr.poke(address.U))
+        val tlbFire = dut.io.to_l2TLB.valid.peekBoolean()
+        val tlbAddress = if (tlbFire)
+          Some(dut.io.to_l2TLB.bits.vaddr.peekInt()) else None
+        val tlbRspFire = pendingTlb.nonEmpty &&
+          dut.io.from_l2TLB.ready.peekBoolean()
+        if (dut.io.dma_cache_req.valid.peekBoolean())
+          cacheSource = Some(dut.io.dma_cache_req.bits.a_source.peekInt())
+        dut.clock.step()
+        if (tlbRspFire) pendingTlb = None
+        if (tlbFire) pendingTlb = tlbAddress
+        cycles += 1
+      }
+      assert(cacheSource.nonEmpty)
+      dut.io.from_l2TLB.valid.poke(false.B)
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+      dut.io.killDone.valid.expect(false.B)
+
+      dut.io.dma_cache_rsp.bits.d_opcode.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_param.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_source.poke(cacheSource.get.U)
+      dut.io.dma_cache_rsp.bits.d_data.foreach(_.poke(0x5a5a5a5aL.U))
+      dut.io.dma_cache_rsp.valid.poke(true.B)
+      while (!dut.io.dma_cache_rsp.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.dma_cache_rsp.valid.poke(false.B)
+
+      var completions = Vector.empty[Completion]
+      var sawDone = false
+      cycles = 0
+      while (!sawDone && cycles < 80) {
+        assert(!dut.io.shared_req.valid.peekBoolean(),
+          "cache payload returned after kill must not become a shared write")
+        if (dut.io.tma_completion.valid.peekBoolean()) {
+          completions :+= Completion(
+            dut.io.tma_completion.bits.wid.peekInt(),
+            dut.io.tma_completion.bits.group.peekInt(),
+            dut.io.tma_completion.bits.is_s2g.peekBoolean(),
+            dut.io.tma_completion.bits.barrierValid.peekBoolean(),
+            dut.io.tma_completion.bits.barrierId.peekInt(),
+            dut.io.tma_completion.bits.transactionBytes.peekInt())
+        }
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone && completions.size == 1)
+      assert(completions.head.barrierValid && completions.head.bytes == 16)
+    }
+  }
+
+  "ASID kill waits for an already accepted S2G write acknowledgement" in {
+    test(compactCore).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      initialize(dut)
+      issue(dut, TmaV2Spec.FunctBulkS2G, wid = 4,
+        in1 = 0x2000, in2 = Seq(16), in3 = 0x1000, group = 1)
+
+      var cycles = 0
+      while (!dut.io.shared_req.valid.peekBoolean() && cycles < 80) {
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(cycles < 80)
+      val sharedSource = dut.io.shared_req.bits.instrId.peekInt()
+      val active = (0 until num_thread).map(lane =>
+        dut.io.shared_req.bits.perLaneAddr(lane).activeMask.peekBoolean())
+      dut.clock.step()
+
+      dut.io.shared_rsp.bits.instrId.poke(sharedSource.U)
+      dut.io.shared_rsp.bits.isWrite.poke(false.B)
+      dut.io.shared_rsp.bits.isMBarrier.poke(false.B)
+      for (lane <- 0 until num_thread) {
+        dut.io.shared_rsp.bits.data(lane).poke((0x400 + lane).U)
+        dut.io.shared_rsp.bits.activeMask(lane).poke(active(lane).B)
+      }
+      dut.io.shared_rsp.valid.poke(true.B)
+      while (!dut.io.shared_rsp.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.shared_rsp.valid.poke(false.B)
+
+      var pendingTlb: Option[BigInt] = None
+      var cacheSource: Option[BigInt] = None
+      cycles = 0
+      while (cacheSource.isEmpty && cycles < 100) {
+        dut.io.from_l2TLB.valid.poke(pendingTlb.nonEmpty.B)
+        pendingTlb.foreach(address =>
+          dut.io.from_l2TLB.bits.paddr.poke(address.U))
+        val tlbFire = dut.io.to_l2TLB.valid.peekBoolean()
+        val tlbAddress = if (tlbFire)
+          Some(dut.io.to_l2TLB.bits.vaddr.peekInt()) else None
+        val tlbRspFire = pendingTlb.nonEmpty &&
+          dut.io.from_l2TLB.ready.peekBoolean()
+        if (dut.io.dma_cache_req.valid.peekBoolean()) {
+          cacheSource = Some(dut.io.dma_cache_req.bits.a_source.peekInt())
+          val opcode = dut.io.dma_cache_req.bits.a_opcode.peekInt()
+          assert(opcode == 0 || opcode == 1)
+        }
+        dut.clock.step()
+        if (tlbRspFire) pendingTlb = None
+        if (tlbFire) pendingTlb = tlbAddress
+        cycles += 1
+      }
+      assert(cacheSource.nonEmpty)
+      dut.io.from_l2TLB.valid.poke(false.B)
+
+      dut.io.killReq.bits.asid.poke(0.U)
+      dut.io.killReq.valid.poke(true.B)
+      dut.clock.step()
+      dut.io.killReq.valid.poke(false.B)
+      for (_ <- 0 until 4) {
+        dut.io.killDone.valid.expect(false.B)
+        assert(!dut.io.dma_cache_req.valid.peekBoolean())
+        dut.clock.step()
+      }
+
+      dut.io.dma_cache_rsp.bits.d_opcode.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_param.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_addr.poke(0.U)
+      dut.io.dma_cache_rsp.bits.d_source.poke(cacheSource.get.U)
+      dut.io.dma_cache_rsp.bits.d_data.foreach(_.poke(0.U))
+      dut.io.dma_cache_rsp.valid.poke(true.B)
+      while (!dut.io.dma_cache_rsp.ready.peekBoolean()) dut.clock.step()
+      dut.clock.step()
+      dut.io.dma_cache_rsp.valid.poke(false.B)
+
+      var completions = 0
+      var sawDone = false
+      cycles = 0
+      while (!sawDone && cycles < 80) {
+        if (dut.io.tma_completion.valid.peekBoolean()) completions += 1
+        sawDone = dut.io.killDone.valid.peekBoolean()
+        dut.clock.step()
+        cycles += 1
+      }
+      assert(sawDone && completions == 1)
+    }
+  }
+
+  "one-entry command FIFO plus Prepare accepts one lookahead and blocks the third data command" in {
+    test(new TmaV2Ingress(commandEntries = 1)).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      dut.io.in.valid.poke(false.B)
+      dut.io.prepared.ready.poke(false.B)
+      dut.io.directCompletion.ready.poke(true.B)
+      dut.io.kill.valid.poke(false.B)
+      dut.io.kill.bits.asid.poke(0.U)
+      dut.io.killActive.poke(false.B)
+      dut.io.killAsid.poke(0.U)
+      dut.io.txReserve.ready.poke(true.B)
+      dut.io.txReserveHeld.poke(false.B)
       dut.io.txReserveResponse.valid.poke(true.B)
       dut.io.txReserveResponse.bits.wid.poke(0.U)
       dut.io.txReserveResponse.bits.accepted.poke(true.B)
@@ -922,7 +1764,7 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
       while (!dut.io.in.ready.peekBoolean()) dut.clock.step()
       dut.clock.step()
       dut.io.in.valid.poke(false.B)
-      while (!dut.io.window.valid.peekBoolean()) dut.clock.step()
+      while (!dut.io.prepared.valid.peekBoolean()) dut.clock.step()
 
       // The control lane must not wait for the stalled bulk window.  A
       // prefetch completes when the descriptor service accepts the hint.
@@ -942,8 +1784,8 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
         sawPrefetch ||= dut.io.descriptorRequest(1).valid.peekBoolean()
         sawPrefetchCompletion ||=
           dut.io.directCompletion.valid.peekBoolean()
-        assert(dut.io.window.valid.peekBoolean(),
-          "bulk payload must remain stable while control lane progresses")
+        assert(dut.io.prepared.valid.peekBoolean(),
+          "prepared bulk command must remain stable while control lane progresses")
         dut.clock.step()
         controlCycles += 1
       }
@@ -963,12 +1805,9 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
           "third data command must wait for the lookahead slot")
         dut.clock.step()
       }
-      dut.io.window.ready.poke(true.B)
-      while (!dut.io.window.valid.peekBoolean()) dut.clock.step()
+      dut.io.prepared.ready.poke(true.B)
+      while (!dut.io.prepared.valid.peekBoolean()) dut.clock.step()
       dut.clock.step()
-      dut.io.engineCompletion.valid.poke(true.B)
-      dut.clock.step()
-      dut.io.engineCompletion.valid.poke(false.B)
       var thirdIssueLatency = 0
       while (!dut.io.in.ready.peekBoolean() && thirdIssueLatency < 12) {
         dut.clock.step()
@@ -980,22 +1819,82 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
     }
   }
 
-  "active tensor permits descriptor prefetch plus one prepared data command" in {
-    test(new TmaV2Ingress).withAnnotations(Seq(CachingAnnotation)) { dut =>
+  "queued TensorMap control kill wins over same-cycle control dequeue" in {
+    test(new TmaV2Ingress(commandEntries = 1))
+      .withAnnotations(Seq(CachingAnnotation)) { dut =>
       dut.io.in.valid.poke(false.B)
-      dut.io.command.ready.poke(true.B)
-      dut.io.window.ready.poke(true.B)
-      dut.io.seal.ready.poke(true.B)
+      dut.io.prepared.ready.poke(true.B)
       dut.io.directCompletion.ready.poke(true.B)
-      dut.io.engineCompletion.valid.poke(false.B)
-      dut.io.engineCompletion.bits.wid.poke(0.U)
-      dut.io.engineCompletion.bits.copyDirection.poke(0.U)
-      dut.io.engineCompletion.bits.group.poke(0.U)
-      dut.io.engineCompletion.bits.barrierValid.poke(false.B)
-      dut.io.engineCompletion.bits.barrierId.poke(0.U)
-      dut.io.engineCompletion.bits.barrierGeneration.poke(0.U)
-      dut.io.engineCompletion.bits.transactionBytes.poke(0.U)
+      dut.io.kill.valid.poke(false.B)
+      dut.io.kill.bits.asid.poke(0.U)
+      dut.io.killActive.poke(false.B)
+      dut.io.killAsid.poke(0.U)
       dut.io.txReserve.ready.poke(true.B)
+      dut.io.txReserveHeld.poke(false.B)
+      dut.io.txReserveResponse.valid.poke(false.B)
+      dut.io.txReserveResponse.bits.wid.poke(0.U)
+      dut.io.txReserveResponse.bits.accepted.poke(false.B)
+      dut.io.txReserveResponse.bits.barrierValid.poke(false.B)
+      dut.io.txReserveResponse.bits.barrierId.poke(0.U)
+      dut.io.txReserveResponse.bits.generation.poke(0.U)
+      for (client <- 0 until 2) {
+        dut.io.descriptorRequest(client).ready.poke(true.B)
+        dut.io.descriptorResponse(client).valid.poke(false.B)
+        pokeDescriptorPayload(dut.io.descriptorResponse(client).bits,
+          Seq.fill(32)(BigInt(0)))
+      }
+      dut.clock.step(2)
+
+      dut.io.in.bits.ctrl.dma.poke(true.B)
+      dut.io.in.bits.ctrl.inst.poke(
+        (BigInt(TmaV2Spec.TensorMapPrefetchSubop) << 27).U)
+      dut.io.in.bits.ctrl.funct.poke(
+        TmaV2Spec.FunctPrefetchTensormap.U)
+      dut.io.in.bits.ctrl.wid.poke(2.U)
+      dut.io.in.bits.ctrl.dma_group.poke(0.U)
+      dut.io.in.bits.ctrl.asid.foreach(_.poke(0.U))
+      for (lane <- 0 until num_thread) {
+        dut.io.in.bits.in1(lane).poke((if (lane == 0) 0x4000 else 0).U)
+        dut.io.in.bits.in2(lane).poke(0.U)
+        dut.io.in.bits.in3(lane).poke(0.U)
+        dut.io.in.bits.mask(lane).poke(true.B)
+      }
+      dut.io.in.valid.poke(true.B)
+      dut.io.in.ready.expect(true.B)
+      dut.clock.step()
+      dut.io.in.valid.poke(false.B)
+
+      // The control queue is ready to dequeue here.  controlKillNow must
+      // dominate the cPrefetchReq transition produced by that same edge.
+      dut.io.kill.valid.poke(true.B)
+      dut.io.kill.bits.asid.poke(0.U)
+      dut.io.killActive.poke(true.B)
+      dut.io.killAsid.poke(0.U)
+      dut.io.descriptorRequest(1).valid.expect(false.B)
+      dut.clock.step()
+      dut.io.kill.valid.poke(false.B)
+
+      dut.io.descriptorRequest(1).valid.expect(false.B)
+      dut.io.directCompletion.valid.expect(true.B)
+      dut.io.directCompletion.bits.wid.expect(2.U)
+      dut.io.directCompletion.bits.transactionBytes.expect(0.U)
+      dut.clock.step()
+      dut.io.directCompletion.valid.expect(false.B)
+      dut.io.descriptorRequest(1).valid.expect(false.B)
+    }
+  }
+
+  "active tensor permits descriptor prefetch plus one prepared data command" in {
+    test(new TmaV2Ingress(commandEntries = 1)).withAnnotations(Seq(CachingAnnotation)) { dut =>
+      dut.io.in.valid.poke(false.B)
+      dut.io.prepared.ready.poke(false.B)
+      dut.io.directCompletion.ready.poke(true.B)
+      dut.io.kill.valid.poke(false.B)
+      dut.io.kill.bits.asid.poke(0.U)
+      dut.io.killActive.poke(false.B)
+      dut.io.killAsid.poke(0.U)
+      dut.io.txReserve.ready.poke(true.B)
+      dut.io.txReserveHeld.poke(false.B)
       dut.io.txReserveResponse.valid.poke(true.B)
       dut.io.txReserveResponse.bits.wid.poke(0.U)
       dut.io.txReserveResponse.bits.accepted.poke(true.B)
@@ -1057,8 +1956,9 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
         val requestFire = dut.io.descriptorRequest(0).valid.peekBoolean()
         prefetchRequest ||= dut.io.descriptorRequest(1).valid.peekBoolean()
         prefetchCompletion ||= dut.io.directCompletion.valid.peekBoolean()
-        tensorLast ||= dut.io.window.valid.peekBoolean() &&
-          dut.io.window.bits.last.peekBoolean()
+        tensorLast ||= dut.io.prepared.valid.peekBoolean() &&
+          dut.io.prepared.bits.kind.peekInt() ==
+            TmaV2PreparedKind.Tensor.litValue
         dut.clock.step()
         descriptorPending = requestFire
         cycles += 1
@@ -1079,9 +1979,8 @@ class TmaV2DmaCore_test extends AnyFreeSpec with ChiselScalatestTester {
         assert(!dut.io.in.ready.peekBoolean())
         dut.clock.step()
       }
-      dut.io.engineCompletion.valid.poke(true.B)
+      dut.io.prepared.ready.poke(true.B)
       dut.clock.step()
-      dut.io.engineCompletion.valid.poke(false.B)
       var bulkWait = 0
       while (!dut.io.in.ready.peekBoolean() && bulkWait < 12) {
         dut.clock.step()

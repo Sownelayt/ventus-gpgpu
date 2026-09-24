@@ -61,7 +61,12 @@ class TmaV2CompiledDescriptor extends Bundle {
   val globalBase = UInt(32.W)
   val globalDims = Vec(TmaV2Spec.RankMax, UInt(33.W))
   val globalStrides = Vec(TmaV2Spec.RankMax - 1, UInt(64.W))
+  // boxDims contains the number of produced traversal positions, not the raw
+  // descriptor box.  The original dim0 extent is retained for the
+  // interleave-only atom scanner.
   val boxDims = Vec(TmaV2Spec.RankMax, UInt(9.W))
+  val strideMinus1 = Vec(TmaV2Spec.RankMax, UInt(3.W))
+  val rawDim0Box = UInt(9.W)
   val interleaveSliceStride = UInt(64.W)
   val logicalBytes = UInt(32.W)
 }
@@ -134,7 +139,10 @@ class TmaV2DescriptorCompiler extends Module {
 
   val compiling = RegInit(false.B)
   val validatePending = RegInit(false.B)
-  val validationFlags = Reg(UInt(9.W))
+  val strideSetupActive = RegInit(false.B)
+  val strideSetupPending =
+    RegInit(0.U(TmaV2Spec.RankMax.W))
+  val validationFlags = Reg(UInt(10.W))
   val resultValid = RegInit(false.B)
   val rankCounter = RegInit(1.U(3.W))
   val logicalPhase = RegInit(false.B)
@@ -149,6 +157,8 @@ class TmaV2DescriptorCompiler extends Module {
   // A set overflow bit compares greater than every 64-bit descriptor stride.
   val requiredSpan = Reg(UInt(65.W))
   val logicalBytes = Reg(UInt(64.W))
+  val rawBoxDims =
+    Reg(Vec(TmaV2Spec.RankMax, UInt(9.W)))
 
   val mulA = WireDefault(0.U(64.W))
   val mulB = WireDefault(0.U(33.W))
@@ -207,10 +217,10 @@ class TmaV2DescriptorCompiler extends Module {
 
   io.in.ready :=
     !validatePending &&
-      !compiling && !multiplyValid && !resultValid
+      !strideSetupActive && !compiling && !multiplyValid && !resultValid
   io.out.valid := resultValid
   io.out.bits := result
-  io.busy := validatePending || compiling ||
+  io.busy := validatePending || strideSetupActive || compiling ||
     multiplyValid
 
   val control = io.in.bits.lowWords(1)
@@ -249,14 +259,49 @@ class TmaV2DescriptorCompiler extends Module {
   val paddedSubByteDtype =
     inputDtype === TmaV2Spec.DTypeB4x16P64.U ||
       inputDtype === TmaV2Spec.DTypeB6.U
-  val boxRowBytes = MuxLookup(inputDtypeBits, 0.U(64.W))(Seq(
-    4.U -> ((io.in.bits.boxDims(0) + 1.U) >> 1),
-    6.U -> ((((io.in.bits.boxDims(0) << 2) +
-      (io.in.bits.boxDims(0) << 1)) + 7.U) >> 3),
-    8.U -> io.in.bits.boxDims(0),
-    16.U -> (io.in.bits.boxDims(0) << 1),
-    32.U -> (io.in.bits.boxDims(0) << 2),
-    64.U -> (io.in.bits.boxDims(0) << 3)))
+  def rowBytesForBits(elements: UInt, dtypeBits: UInt): UInt =
+    MuxLookup(dtypeBits, 0.U(64.W))(Seq(
+    4.U -> ((elements + 1.U) >> 1),
+    6.U -> ((((elements << 2) + (elements << 1)) + 7.U) >> 3),
+    8.U -> elements,
+    16.U -> (elements << 1),
+    32.U -> (elements << 2),
+    64.U -> (elements << 3)))
+  def rowBytes(elements: UInt): UInt =
+    rowBytesForBits(elements, inputDtypeBits)
+  def interleaveBytes(positions: UInt, interleave: UInt): UInt =
+    Mux(interleave === TmaV2Spec.Interleave16.U,
+      (positions.pad(64) << 4)(63, 0),
+      (positions.pad(64) << 5)(63, 0))
+  def inputChannelSliceMetadata(dimension: Int): Bool =
+    inputInterleave =/= TmaV2Spec.InterleaveNone.U &&
+      (dimension + 2).U === inputRank
+
+  // A valid box is at most 256 and an element stride is in 1..8.  Use one
+  // nine-step restoring divider during the non-unit-stride setup state.  In
+  // particular, do not apply `/` to the raw 32-bit descriptor fields: that
+  // would replicate wide constant dividers once per dimension in the input
+  // capture path.
+  def ceilDivElementStride(elements: UInt, stride: UInt): UInt = {
+    val roundedWide =
+      elements.pad(10) +& stride.pad(10) - 1.U
+    val rounded = roundedWide(8, 0)
+    var remainder = 0.U(5.W)
+    var quotient = 0.U(9.W)
+    for (bit <- 8 to 0 by -1) {
+      val shifted = Cat(remainder(3, 0), rounded(bit))
+      val subtract = shifted >= stride.pad(5)
+      remainder = Mux(subtract,
+        (shifted - stride.pad(5))(4, 0), shifted)
+      quotient = quotient | (subtract.asUInt << bit)
+    }
+    quotient
+  }
+  val rawBoxRowBytes = rowBytes(io.in.bits.boxDims(0))
+  val initialLogicalBytes = Mux(
+    inputInterleave === TmaV2Spec.InterleaveNone.U,
+    rawBoxRowBytes,
+    interleaveBytes(io.in.bits.boxDims(0), inputInterleave))
   val dim0Elements = Mux(io.in.bits.lowWords(3) === 0.U,
     (BigInt(1) << 32).U(33.W), io.in.bits.lowWords(3))
   val dim0RequiredSpan = MuxLookup(inputDtypeBits, 0.U(65.W))(Seq(
@@ -282,14 +327,34 @@ class TmaV2DescriptorCompiler extends Module {
        else false.B)
     Mux(active, activeBad, inactiveBad)
   }.reduce(_ || _)
-  // The memory-format slots remain for CUDA TensorMap compatibility, but
-  // Ventus deliberately does not implement element stride.  Active slots
-  // must contain the fixed placeholder 1; inactive slots remain zero.
-  val unsupportedElementStride =
+  val inactiveElementStrideBad =
     (0 until TmaV2Spec.RankMax).map { dimension =>
-      dimension.U < inputRank &&
-        io.in.bits.elementStrides(dimension) =/= 1.U
+      inputRank >= TmaV2Spec.RankMin.U &&
+        inputRank <= TmaV2Spec.RankMax.U &&
+        dimension.U >= inputRank &&
+        io.in.bits.elementStrides(dimension) =/= 0.U
     }.reduce(_ || _)
+  val badElementStride =
+    (0 until TmaV2Spec.RankMax).map { dimension =>
+      val active = dimension.U < inputRank
+      val stride = io.in.bits.elementStrides(dimension)
+      active && (stride < TmaV2Spec.ElementStrideMin.U ||
+        stride > TmaV2Spec.ElementStrideMax.U ||
+        (if (dimension == 0)
+          inputInterleave === TmaV2Spec.InterleaveNone.U && stride =/= 1.U
+         else false.B))
+    }.reduce(_ || _)
+  val inputStrideSetupPending = VecInit(
+    (0 until TmaV2Spec.RankMax).map { dimension =>
+      val stride = io.in.bits.elementStrides(dimension)
+      dimension.U < inputRank &&
+        stride > TmaV2Spec.ElementStrideMin.U &&
+        stride <= TmaV2Spec.ElementStrideMax.U &&
+        !inputChannelSliceMetadata(dimension) &&
+        (if (dimension == 0)
+          inputInterleave =/= TmaV2Spec.InterleaveNone.U
+         else true.B)
+    }).asUInt
   val unusedStrideBad =
     (0 until TmaV2Spec.RankMax - 1).map { dimension =>
       (dimension + 1).U >= inputRank &&
@@ -302,7 +367,7 @@ class TmaV2DescriptorCompiler extends Module {
     (inputInterleave === TmaV2Spec.Interleave32.U &&
       inputSwizzle =/= TmaV2Spec.Swizzle32.U) ||
     (inputSwizzle =/= TmaV2Spec.SwizzleNone.U &&
-      boxRowBytes > swizzleSpan)
+      rawBoxRowBytes > swizzleSpan)
   val badSubByte = subByteDtype &&
     (inputOobFill =/= TmaV2Spec.OobZero.U ||
       inputInterleave =/= TmaV2Spec.InterleaveNone.U ||
@@ -330,19 +395,21 @@ class TmaV2DescriptorCompiler extends Module {
       inputAccessMode =/= TmaV2Spec.AccessTiled.U ||
       inputAtomicity =/= TmaV2Spec.SwizzleAtom16.U ||
       inputSwizzle > TmaV2Spec.Swizzle128.U ||
-      badOob || badSubByte || unsupportedElementStride
+      badOob || badSubByte
   val inputValidationFlags = VecInit(Seq(
     io.in.bits.lowWords(0) =/= TmaV2Spec.DescriptorMagic.U,
     control(31, 21) =/= 0.U || control(15) ||
-      io.in.bits.reservedBad || unusedStrideBad,
+      io.in.bits.reservedBad || unusedStrideBad ||
+      inactiveElementStrideBad,
     !supportedDtype,
     inputRank < TmaV2Spec.RankMin.U ||
       inputRank > TmaV2Spec.RankMax.U,
     unsupportedFeatureBad,
     badLayout,
     (io.in.bits.lowWords(2) & alignmentMask) =/= 0.U,
-    activeFieldBad || badPackedFp4Dimension || boxRowBytes === 0.U ||
-      boxRowBytes(3, 0) =/= 0.U,
+    activeFieldBad || badPackedFp4Dimension || rawBoxRowBytes === 0.U ||
+      rawBoxRowBytes(3, 0) =/= 0.U,
+    badElementStride,
     io.in.bits.globalBaseHigh =/= 0.U))
 
   when(io.in.fire) {
@@ -357,25 +424,32 @@ class TmaV2DescriptorCompiler extends Module {
     resultWrite.swizzle := inputSwizzle
     resultWrite.oobFill := inputOobFill === TmaV2Spec.OobNaN.U
     resultWrite.globalBase := io.in.bits.lowWords(2)
-    resultWrite.logicalBytes := boxRowBytes(31, 0)
+    resultWrite.logicalBytes := initialLogicalBytes(31, 0)
+    resultWrite.rawDim0Box := io.in.bits.boxDims(0)(8, 0)
     for (dimension <- 0 until TmaV2Spec.RankMax) {
       resultWrite.globalDims(dimension) := Mux(
         io.in.bits.lowWords(3 + dimension) === 0.U,
         (BigInt(1) << 32).U, io.in.bits.lowWords(3 + dimension))
-      resultWrite.boxDims(dimension) :=
-        io.in.bits.boxDims(dimension)(8, 0)
+      resultWrite.boxDims(dimension) := Mux(
+        inputChannelSliceMetadata(dimension), 1.U,
+        io.in.bits.boxDims(dimension)(8, 0))
+      resultWrite.strideMinus1(dimension) := Mux(
+        dimension.U < inputRank,
+        (io.in.bits.elementStrides(dimension) - 1.U)(2, 0), 0.U)
       if (dimension < TmaV2Spec.RankMax - 1) {
         resultWrite.globalStrides(dimension) := Cat(
           io.in.bits.globalStrideHigh(dimension),
           io.in.bits.lowWords(8 + dimension))
       }
+      rawBoxDims(dimension) := io.in.bits.boxDims(dimension)(8, 0)
     }
     requiredSpan := dim0RequiredSpan
-    logicalBytes := boxRowBytes
+    logicalBytes := initialLogicalBytes
+    strideSetupPending := inputStrideSetupPending
   }
 
   // Each potentially broad predicate first ends at one flag bit. The
-  // priority encoder therefore sees only nine registered inputs instead of
+  // priority encoder therefore sees only ten registered inputs instead of
   // descriptor fields, dimension comparisons and layout decoding.
   val capturedStatus = WireDefault(TmaV2Status.Ok)
   when(validationFlags(0)) {
@@ -395,6 +469,8 @@ class TmaV2DescriptorCompiler extends Module {
   }.elsewhen(validationFlags(7)) {
     capturedStatus := TmaV2Status.BadDimension
   }.elsewhen(validationFlags(8)) {
+    capturedStatus := TmaV2Status.BadStride
+  }.elsewhen(validationFlags(9)) {
     capturedStatus := TmaV2Status.AddressOverflow
   }
   when(validatePending) {
@@ -407,7 +483,59 @@ class TmaV2DescriptorCompiler extends Module {
     logicalPhase := false.B
     finishPhase := false.B
     validatePending := false.B
-    compiling := true.B
+    when(strideSetupPending.orR) {
+      strideSetupActive := true.B
+      compiling := false.B
+    }.otherwise {
+      compiling := true.B
+    }
+  }
+
+  val strideSetupDimension = PriorityEncoder(strideSetupPending)
+  val strideSetupStride =
+    result.strideMinus1(strideSetupDimension).pad(4) + 1.U(4.W)
+  val strideSetupBox = rawBoxDims(strideSetupDimension)
+  val strideSetupEffective =
+    ceilDivElementStride(strideSetupBox, strideSetupStride)
+  val strideSetupGlobal = result.globalStrides(
+    (strideSetupDimension - 1.U)(1, 0))
+  val unsigned64Max = (BigInt(1) << 64) - 1
+  val strideSetupMaxInput = MuxLookup(
+    strideSetupStride, unsigned64Max.U(64.W))(
+      (2 to TmaV2Spec.ElementStrideMax).map { factor =>
+        factor.U -> (unsigned64Max / factor).U(64.W)
+      })
+  // CUDA limits global strides to less than 2^40, but the Ventus raw ABI
+  // retains all 64 bits.  Reject a raw outer stride that would wrap the
+  // Execute shift/add multiplier instead of silently changing its address.
+  val strideSetupAddressOverflow = strideSetupDimension =/= 0.U &&
+    strideSetupGlobal > strideSetupMaxInput
+  val strideSetupBit =
+    (1.U(TmaV2Spec.RankMax.W) << strideSetupDimension)(
+      TmaV2Spec.RankMax - 1, 0)
+  val strideSetupRemaining = strideSetupPending & ~strideSetupBit
+
+  when(strideSetupActive) {
+    resultWriteValid := true.B
+    resultWrite.boxDims(strideSetupDimension) := strideSetupEffective
+    when(result.status === TmaV2Status.Ok && strideSetupAddressOverflow) {
+      resultWrite.status := TmaV2Status.AddressOverflow
+    }
+    when(strideSetupDimension === 0.U) {
+      val effectiveRowBytes = Mux(
+        result.interleave === TmaV2Spec.InterleaveNone.U,
+        rowBytesForBits(
+          strideSetupEffective,
+          TmaV2DescriptorDerived.dtypeBits(result.dtype)),
+        interleaveBytes(strideSetupEffective, result.interleave))
+      logicalBytes := effectiveRowBytes
+      resultWrite.logicalBytes := effectiveRowBytes(31, 0)
+    }
+    strideSetupPending := strideSetupRemaining
+    when(!strideSetupRemaining.orR) {
+      strideSetupActive := false.B
+      compiling := true.B
+    }
   }
 
   // Launch one micro-op every cycle and advance the small control sequence.
@@ -531,27 +659,23 @@ class TmaV2CommandBinder extends Module {
   val compiledDtypeBits = TmaV2DescriptorDerived.dtypeBits(compiled.dtype)
   val compiledByteShift =
     TmaV2DescriptorDerived.elementByteShift(compiledDtypeBits)
-  val compiledChannelsLog2 =
-    TmaV2DescriptorDerived.channelsLog2(
-      compiled.interleave, compiledByteShift)
   val coordinate = binding.request.coordinates(dimension)
   val strideIndex = Mux(dimension === 0.U, 0.U, dimension - 1.U)(1, 0)
-  val channelMask = (1.U(64.W) << compiledChannelsLog2) - 1.U
-  val slice = coordinate >> compiledChannelsLog2
-  val inSlice = coordinate.asUInt & channelMask
   val dim0Origin = MuxLookup(compiledDtypeBits,
     (coordinate.pad(64) << compiledByteShift).asSInt)(Seq(
       4.U -> (coordinate >> 1).pad(64),
       6.U -> (((coordinate.pad(64) << 1) +
         coordinate.pad(64)) >> 2).asSInt))
+  val interleaveAtomBytes = Mux(
+    compiled.interleave === TmaV2Spec.Interleave16.U,
+    16.U(64.W), 32.U(64.W))
 
   val launchUsesMultiply = dimension =/= 0.U ||
     compiled.interleave =/= TmaV2Spec.InterleaveNone.U
-  val launchMultiplicand = Mux(
-    dimension === 0.U, slice, coordinate)
+  val launchMultiplicand = coordinate
   val launchStride = Mux(
     dimension === 0.U,
-    compiled.interleaveSliceStride,
+    interleaveAtomBytes,
     compiled.globalStrides(strideIndex))
   val multiplicand33 =
     Cat(launchMultiplicand(31), launchMultiplicand.asUInt).asSInt
@@ -589,11 +713,7 @@ class TmaV2CommandBinder extends Module {
     (launchProductTerms(4) +& launchProductTerms(5))(67, 0)
   val launchHighSum =
     (launchHigh01 +& launchProductTerms(6))(67, 0)
-  val launchAddend = Mux(
-    dimension === 0.U &&
-      compiled.interleave =/= TmaV2Spec.InterleaveNone.U,
-    (inSlice << compiledByteShift).zext,
-    0.S(64.W))
+  val launchAddend = 0.S(64.W)
 
   io.in.ready :=
     !launching && !multiplyValid && !assembleValid && !done
@@ -671,8 +791,9 @@ class TmaV2CommandBinder extends Module {
     assembleAddend := multiplyAddend
   }
 
-  // Stage 3: add the interleave in-slice term, commit one origin, and
-  // accumulate the command origin for the final dynamic overflow check.
+  // Stage 3: commit one origin and accumulate the command origin for the
+  // final dynamic overflow check. Interleaved dim0 was multiplied directly
+  // by its 16B/32B atom size in stage 1, so it needs no lane addend here.
   when(assembleValid) {
     val completedOriginWide = assembleProduct + assembleAddend
     val completedOrigin =
@@ -691,10 +812,10 @@ class TmaV2CommandBinder extends Module {
         dynamicStatus := TmaV2Status.Ok
         when(binding.request.sharedBase(6, 0) =/= 0.U) {
           dynamicStatus := TmaV2Status.BadAlignment
-        }.elsewhen(badReduce || badSubByteCommand || badOobDirection) {
-          dynamicStatus := TmaV2Status.UnsupportedFeature
         }.elsewhen(badNegative) {
           dynamicStatus := TmaV2Status.BadCoordinate
+        }.elsewhen(badReduce || badSubByteCommand || badOobDirection) {
+          dynamicStatus := TmaV2Status.UnsupportedFeature
         }.elsewhen(dynamicOriginOverflow) {
           dynamicStatus := TmaV2Status.AddressOverflow
         }.elsewhen(badBoundingBoxAlignment) {

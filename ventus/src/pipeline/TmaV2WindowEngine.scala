@@ -109,13 +109,20 @@ class TmaV2WindowEngine(
       Flipped(Decoupled(new TmaV2TlbResponse(lineEntries)))
     val sharedRequest =
       Decoupled(new TmaV2SharedRequest(sharedEntries))
+    // Set only after this exact queue head has been presented at the final
+    // external boundary and stalled.  Such a beat must survive command kill.
+    val sharedRequestHeld = Input(Bool())
     val sharedResponse =
       Flipped(Decoupled(new TmaV2SharedResponse(sharedEntries)))
     val cacheRequest =
       Decoupled(new TmaV2CacheRequest(cacheSourceEntries))
+    val cacheRequestHeld = Input(Bool())
     val cacheResponse =
       Flipped(Decoupled(new TmaV2CacheResponse(cacheSourceEntries)))
     val completion = Decoupled(new TmaV2EngineCompletion)
+    val kill = Flipped(Valid(new TmaV2KillRequest))
+    val killAsid = Input(UInt(SV32.asidLen.W))
+    val killPending = Output(Bool())
 
     val activeCommands = Output(UInt(1.W))
     val activeWindows = Output(UInt(activeWidth.W))
@@ -155,6 +162,7 @@ class TmaV2WindowEngine(
     Reg(UInt(log2Ceil(TmaV2Spec.MbarrierEntries).W))
   val commandBarrierGeneration = Reg(UInt(8.W))
   val commandTransactionBytes = Reg(UInt(32.W))
+  val commandKilled = RegInit(false.B)
   // Keep the small-transfer issue credit at 16 to control L2 tail latency;
   // larger commands retain
   // all 40 LineContexts and therefore the intended long-transfer overlap.
@@ -176,7 +184,12 @@ class TmaV2WindowEngine(
     commandBarrierId := io.command.bits.barrierId
     commandBarrierGeneration := io.command.bits.barrierGeneration
     commandTransactionBytes := io.command.bits.transactionBytes
+    commandKilled := false.B
   }
+  val killMatch = io.kill.valid && commandValid &&
+    commandAsid === io.kill.bits.asid
+  val killMode = commandKilled || killMatch
+  io.killPending := commandValid && commandAsid === io.killAsid
   val dtypeBits = TmaV2DescriptorDerived.dtypeBits(commandDtype)
   val paddedFp4 = commandDtype === TmaV2Spec.DTypeB4x16P64.U
   val paddedFp6 = commandDtype === TmaV2Spec.DTypeB6.U
@@ -462,7 +475,7 @@ class TmaV2WindowEngine(
   val directResponseCandidate = routeCandidateValid && recentMatch &&
     returningRead && returningReadLine === recentMatchLeader
   val directResponseFire = WireDefault(false.B)
-  val routeCandidateFire = routeCandidateValid &&
+  val routeCandidateFire = routeCandidateValid && !killMode &&
     !directResponseCandidate && hasFreeLine
   val routeCandidateReady =
     !routeCandidateValid || routeCandidateFire || directResponseFire
@@ -477,7 +490,7 @@ class TmaV2WindowEngine(
   // Fill is produced only after all real line routes have left the
   // decomposer. A returning cache response has priority over this synthetic
   // payload allocation.
-  val fillCanAllocate = decompValid && !decompPending.orR &&
+  val fillCanAllocate = decompValid && !killMode && !decompPending.orR &&
     (!routeCandidateValid || routeCandidateFire) &&
     decompFillPending && hasFreePayload && !returningRead
   val fillFire = fillCanAllocate
@@ -569,7 +582,7 @@ class TmaV2WindowEngine(
 
   val s2gWindowReady = hasFreePayload && !returningRead
   val g2sWindowReady = !decompValid || decompRelease
-  val normalizedWindowReady = windowMatches && Mux(
+  val normalizedWindowReady = windowMatches && !killMode && Mux(
     commandDirection === TmaV2Spec.DirectionS2G.U,
     s2gWindowReady, g2sWindowReady)
   io.window.ready := normalizedWindowReady
@@ -734,7 +747,7 @@ class TmaV2WindowEngine(
     (completeS2GResponse || residentS2GDecompVec.asUInt.orR) &&
     selectedS2GPending.orR
 
-  val s2gDecompFire = s2gDecompValid && hasFreeLine &&
+  val s2gDecompFire = s2gDecompValid && hasFreeLine && !killMode &&
     commandDirection === TmaV2Spec.DirectionS2G.U
 
   when(s2gDecompFire) {
@@ -817,7 +830,7 @@ class TmaV2WindowEngine(
     Cat(lineAddressTag(translateLine), 0.U(7.W))
   io.tlbRequest.bits.asid := commandAsid
   translateGroupArb.io.out.ready := false.B
-  when(translateGroupArb.io.out.valid) {
+  when(translateGroupArb.io.out.valid && !killMode) {
     when(selectedTranslationHit) {
       translateGroupArb.io.out.ready := true.B
       lineAddressTag(translateLine) :=
@@ -853,13 +866,14 @@ class TmaV2WindowEngine(
   when(io.tlbResponse.fire) {
     assert(io.tlbResponse.bits.source === tlbMissSource)
     val ppn = io.tlbResponse.bits.physicalAddress(31, 12)
-    translationValid(translationRr) := true.B
+    translationValid(translationRr) := !killMode
     translationVpn(translationRr) := tlbMissVpn
     translationPpn(translationRr) := ppn
     translationRr := translationRr + 1.U
     lineAddressTag(tlbMissSource) :=
       Cat(ppn, lineAddressTag(tlbMissSource)(4, 0))
-    lineState(tlbMissSource) := LineState.NeedCache
+    lineState(tlbMissSource) := Mux(
+      killMode, LineState.Free, LineState.NeedCache)
     tlbMissValid := false.B
   }
 
@@ -1038,11 +1052,16 @@ class TmaV2WindowEngine(
   val cacheIssueQueue = Module(new Queue(
     new TmaV2CacheRequest(cacheSourceEntries),
     1, pipe = true, flow = false))
-  io.cacheRequest <> cacheIssueQueue.io.deq
-  cacheGroupArb.io.out.ready := !s2gSharedMerge &&
+  val retainCacheRequest = killMode && io.cacheRequestHeld
+  io.cacheRequest.valid := cacheIssueQueue.io.deq.valid &&
+    (!killMode || retainCacheRequest)
+  io.cacheRequest.bits := cacheIssueQueue.io.deq.bits
+  cacheIssueQueue.io.deq.ready := Mux(
+    killMode && !retainCacheRequest, true.B, io.cacheRequest.ready)
+  cacheGroupArb.io.out.ready := !killMode && !s2gSharedMerge &&
     cacheIssueQueue.io.enq.ready &&
     (!cacheWrite || hasFreeAck) && g2sCanIssue
-  cacheIssueQueue.io.enq.valid := !s2gSharedMerge &&
+  cacheIssueQueue.io.enq.valid := !killMode && !s2gSharedMerge &&
     cacheGroupArb.io.out.valid &&
     (!cacheWrite || hasFreeAck) && g2sCanIssue
   cacheIssueQueue.io.enq.bits.write := cacheWrite
@@ -1108,7 +1127,9 @@ class TmaV2WindowEngine(
   val responsePayloadSpace = Mux(
     responseHasFollower, hasTwoFreePayloads, hasFreePayload)
   io.cacheResponse.ready := Mux(
-    responseIsRead, responsePayloadSpace && !responseFollowerRoutePending,
+    responseIsRead,
+      Mux(killMode, responseLineWaiting,
+        responsePayloadSpace && !responseFollowerRoutePending),
     responseIsAck && responseAckWaiting)
 
   def alignLineToPayload(routeBits: UInt): (UInt, UInt) = {
@@ -1152,18 +1173,22 @@ class TmaV2WindowEngine(
     responseIsRead && directResponseCandidate
   when(io.cacheResponse.fire && responseIsRead) {
     assert(lineState(responseLine) === LineState.WaitCache)
-    payloadData(freePayload0) := responseLeaderData
-    payloadMeta(freePayload0) := responseLeaderMeta
-    payloadState(freePayload0) := PayloadState.G2SReady
     lineState(responseLine) := LineState.Free
+    when(!killMode) {
+      payloadData(freePayload0) := responseLeaderData
+      payloadMeta(freePayload0) := responseLeaderMeta
+      payloadState(freePayload0) := PayloadState.G2SReady
+    }
     when(responsePairValid) {
       val follower = responseFollower
-      payloadData(freePayload1) := responseSecondData
-      payloadMeta(freePayload1) := responseSecondMeta
-      payloadState(freePayload1) := PayloadState.G2SReady
+      when(!killMode) {
+        payloadData(freePayload1) := responseSecondData
+        payloadMeta(freePayload1) := responseSecondMeta
+        payloadState(freePayload1) := PayloadState.G2SReady
+      }
       lineState(follower) := LineState.Free
       pairValid(responsePairEntry) := false.B
-    }.elsewhen(directResponseCandidate) {
+    }.elsewhen(directResponseCandidate && !killMode) {
       payloadData(freePayload1) := responseSecondData
       payloadMeta(freePayload1) := responseSecondMeta
       payloadState(freePayload1) := PayloadState.G2SReady
@@ -1251,8 +1276,14 @@ class TmaV2WindowEngine(
   val sharedIssueQueue = Module(new Queue(
     new TmaV2SharedRequest(sharedEntries),
     1, pipe = true, flow = false))
-  io.sharedRequest <> sharedIssueQueue.io.deq
-  sharedIssueQueue.io.enq.valid := outgoingPayloadValid && hasFreeShared
+  val retainSharedRequest = killMode && io.sharedRequestHeld
+  io.sharedRequest.valid := sharedIssueQueue.io.deq.valid &&
+    (!killMode || retainSharedRequest)
+  io.sharedRequest.bits := sharedIssueQueue.io.deq.bits
+  sharedIssueQueue.io.deq.ready := Mux(
+    killMode && !retainSharedRequest, true.B, io.sharedRequest.ready)
+  sharedIssueQueue.io.enq.valid :=
+    outgoingPayloadValid && hasFreeShared && !killMode
   sharedIssueQueue.io.enq.bits.write := outgoingG2S
   sharedIssueQueue.io.enq.bits.source := freeShared
   sharedIssueQueue.io.enq.bits.sharedSetIdx :=
@@ -1295,7 +1326,7 @@ class TmaV2WindowEngine(
     when(!sharedRemaining.orR) {
       sharedValid(sharedSource) := false.B
     }
-    when(commandDirection === TmaV2Spec.DirectionS2G.U) {
+    when(commandDirection === TmaV2Spec.DirectionS2G.U && !killMode) {
       val payload = sharedPayload(sharedSource)
       val responseMeta = s2gPostMeta(payload)
       // s2gSharedMerge selects this payload onto the sole read port for every
@@ -1326,6 +1357,9 @@ class TmaV2WindowEngine(
       }.otherwise {
         payloadData(payload) := mergedWords.asUInt
       }
+    }.elsewhen(commandDirection === TmaV2Spec.DirectionS2G.U &&
+        !selectedSharedRemaining.orR) {
+      payloadState(sharedPayload(sharedSource)) := PayloadState.Free
     }
   }
 
@@ -1396,7 +1430,7 @@ class TmaV2WindowEngine(
       recyclePayloadValid && freePayload0 === recyclePayload) {
     payloadState(freePayload0) := PayloadState.S2GNeedShared
   }
-  when(io.cacheResponse.fire && responseIsRead) {
+  when(io.cacheResponse.fire && responseIsRead && !killMode) {
     payloadState(freePayload0) := PayloadState.G2SReady
     when(responseHasFollower) {
       payloadState(freePayload1) := PayloadState.G2SReady
@@ -1423,6 +1457,63 @@ class TmaV2WindowEngine(
   }
   when(s2gDecompFire) {
     lineState(freeLine) := LineState.RouteWrite
+  }
+
+  // Kill is a command-local flush plus response drain. States which have not
+  // crossed an external Decoupled boundary are discarded immediately. TLB,
+  // cache, shared and write-ack owners which already fired remain resident
+  // until their matching response is consumed.
+  when(killMatch) {
+    commandKilled := true.B
+    commandSealed := true.B
+    decompValid := false.B
+    decompFillPending := false.B
+    routeCandidateValid := false.B
+    lineWriteValid := false.B
+    recentValid.foreach(_ := false.B)
+    pairValid.foreach(_ := false.B)
+    translationValid.foreach(_ := false.B)
+
+    for (line <- 0 until lineEntries) {
+      when(lineState(line) =/= LineState.WaitTranslate &&
+          lineState(line) =/= LineState.WaitCache) {
+        lineState(line) := LineState.Free
+      }
+    }
+    for (payload <- 0 until payloadEntries) {
+      when(payloadState(payload) =/= PayloadState.S2GWaitShared) {
+        payloadState(payload) := PayloadState.Free
+        payloadOutstanding(payload) := 0.U
+        payloadPending(payload) := 0.U
+      }
+    }
+
+    // These two one-entry queues own resources at enqueue time. If their
+    // request has not fired externally, drop the queue head and undo that
+    // ownership here.
+    when(cacheIssueQueue.io.deq.valid && !io.cacheRequestHeld) {
+      val source = cacheIssueQueue.io.deq.bits.source
+      when(cacheIssueQueue.io.deq.bits.write) {
+        for (ack <- 0 until writeAckEntries) {
+          when(source === ack.U) { writeAckValid(ack) := false.B }
+        }
+      }.otherwise {
+        for (line <- 0 until lineEntries) {
+          when(source === line.U) { lineState(line) := LineState.Free }
+        }
+      }
+    }
+    when(sharedIssueQueue.io.deq.valid && !io.sharedRequestHeld) {
+      val source = sharedIssueQueue.io.deq.bits.source
+      for (entry <- 0 until sharedEntries) {
+        when(source === entry.U) {
+          sharedValid(entry) := false.B
+          payloadState(sharedPayload(entry)) := PayloadState.Free
+          payloadOutstanding(sharedPayload(entry)) := 0.U
+          payloadPending(sharedPayload(entry)) := 0.U
+        }
+      }
+    }
   }
 
   io.seal.ready := commandValid && !commandSealed
@@ -1458,6 +1549,7 @@ class TmaV2WindowEngine(
     translationValid.foreach(_ := false.B)
     recentValid.foreach(_ := false.B)
     pairValid.foreach(_ := false.B)
+    commandKilled := false.B
   }
   io.completion.valid := completionQ.io.deq.valid
   completionQ.io.deq.ready := io.completion.ready
@@ -1517,6 +1609,14 @@ class TmaV2WindowEngine(
   }
 
   when(!reset.asBool) {
+    when(killMode) {
+      assert(!io.tlbRequest.fire,
+        "a killed TMA command must not issue a new TLB request")
+      assert(!io.cacheRequest.fire || io.cacheRequestHeld,
+        "only a pre-kill irrevocable cache request may fire after kill")
+      assert(!io.sharedRequest.fire || io.sharedRequestHeld,
+        "only a pre-kill irrevocable shared request may fire after kill")
+    }
     assert(!normalizedWindowFire ||
       PopCount(normalizedWindow.lanes.map(_.valid)) > 0.U)
     assert(!io.command.fire || !commandValid)

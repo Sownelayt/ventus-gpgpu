@@ -101,6 +101,8 @@ class pipe() extends Module{
   val mul=Module(new vMULv2(num_thread,num_lane))
   val tensorcore=Module(new vTCexe)
   val dma_core=Module(new TmaV2DmaCore)
+  dma_core.io.killReq.valid := false.B
+  dma_core.io.killReq.bits.asid := 0.U
   val tmaGroupTracker = Module(new TmaV2S2GGroupTracker)
   val tmaMbarrier = Module(new TmaV2MbarrierController)
   dma_core.io.perfEnable := io.perfEnable

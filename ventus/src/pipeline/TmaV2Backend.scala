@@ -40,8 +40,8 @@ class TmaV2DescriptorEvents extends Bundle {
 
 class TmaV2DescriptorService(
     entries: Int = TmaV2Spec.DefaultDescriptorEntries) extends Module {
-  require(entries == 2 || entries == 4,
-    "compiled descriptor store supports two or four entries")
+  require(entries == 2 || entries == 4 || entries == 8,
+    "compiled descriptor store supports two, four or eight entries")
   private val entryWidth = log2Ceil(entries)
   private val tagWidth = 32 - log2Ceil(TmaV2Spec.DescriptorAlignment)
 
@@ -67,9 +67,10 @@ class TmaV2DescriptorService(
   val tag = Reg(Vec(entries, UInt(tagWidth.W)))
   val tagAsid = Reg(Vec(entries, UInt(SV32.asidLen.W)))
   val data = Reg(Vec(entries, new TmaV2CompiledDescriptor))
-  // Each bit names the subtree to evict next. Three bits implement a
-  // four-way tree; the two-entry area point uses bit zero only.
-  val plru = RegInit(0.U((entries - 1).W))
+  // Binary-tree pseudo-LRU. Bit zero is the root and children use heap
+  // numbering, so the same implementation covers the 2/4/8-entry area
+  // points without putting a tag CAM in the replacement path.
+  val plru = RegInit(VecInit(Seq.fill(entries - 1)(false.B)))
 
   val compilerEntry = Reg(UInt(entryWidth.W))
   val refillWait = RegInit(false.B)
@@ -78,8 +79,9 @@ class TmaV2DescriptorService(
   val retryDemand = RegInit(false.B)
 
   // Demand pins a compiled-store entry until Binder captures it, so the
-  // 612-bit compiled payload is never copied into a second response register.
+  // 636-bit compiled payload is never copied into a second response register.
   val responseValid = RegInit(VecInit(Seq.fill(2)(false.B)))
+  val responseIsInvalidate = RegInit(VecInit(Seq.fill(2)(false.B)))
   val demandResponseEntry = Reg(UInt(entryWidth.W))
 
   val events = WireDefault(0.U.asTypeOf(new TmaV2DescriptorEvents))
@@ -120,6 +122,7 @@ class TmaV2DescriptorService(
       0.U.asTypeOf(new TmaV2CompiledDescriptor))
     when(io.response(client).fire) {
       responseValid(client) := false.B
+      responseIsInvalidate(client) := false.B
     }
     io.request(client).ready := false.B
   }
@@ -167,15 +170,20 @@ class TmaV2DescriptorService(
   val invalidEntry = PriorityEncoder(invalidVec)
   val replaceableVec = VecInit((0 until entries).map { entry =>
     state(entry) === EntryState.Valid &&
-      !(responseValid(0) && demandResponseEntry === entry.U)
+      !(responseValid(0) && !responseIsInvalidate(0) &&
+        demandResponseEntry === entry.U)
   })
   val hasReplaceable = replaceableVec.asUInt.orR
-  val plruVictim = if (entries == 2) {
-    plru(0).asUInt
-  } else {
-    Mux(plru(0), Cat(1.U(1.W), plru(2)),
-      Cat(0.U(1.W), plru(1)))
+  def victimPath(treeNode: Int, leaves: Int): UInt = {
+    if (leaves == 2) {
+      plru(treeNode).asUInt
+    } else {
+      val left = victimPath(treeNode * 2 + 1, leaves / 2)
+      val right = victimPath(treeNode * 2 + 2, leaves / 2)
+      Cat(plru(treeNode), Mux(plru(treeNode), right, left))
+    }
   }
+  val plruVictim = victimPath(0, entries)
   val plruReplaceable = replaceableVec(plruVictim)
   val replacementEntry = Mux(
     plruReplaceable, plruVictim, PriorityEncoder(replaceableVec))
@@ -183,13 +191,18 @@ class TmaV2DescriptorService(
   val allocationAvailable = hasInvalid || hasReplaceable
 
   def touch(entry: UInt): Unit = {
-    if (entries == 2) {
-      plru := ~entry(0)
-    } else {
-      plru := Cat(
-        Mux(entry(1), ~entry(0), plru(2)),
-        Mux(!entry(1), ~entry(0), plru(1)),
-        ~entry(1))
+    for (level <- 0 until entryWidth) {
+      val nodesAtLevel = 1 << level
+      val directionBit = entryWidth - 1 - level
+      val leavesPerNode = entries >> level
+      for (nodeAtLevel <- 0 until nodesAtLevel) {
+        val firstLeaf = nodeAtLevel * leavesPerNode
+        val pastLastLeaf = firstLeaf + leavesPerNode
+        val treeNode = (1 << level) - 1 + nodeAtLevel
+        when(entry >= firstLeaf.U && entry < pastLastLeaf.U) {
+          plru(treeNode) := ~entry(directionBit)
+        }
+      }
     }
   }
 
@@ -258,6 +271,7 @@ class TmaV2DescriptorService(
         }
         when(selectedRequest.wantResponse) {
           responseValid(selected) := true.B
+          responseIsInvalidate(selected) := true.B
         }
       }
     }.elsewhen(validHit) {
@@ -268,6 +282,7 @@ class TmaV2DescriptorService(
         when(selectedDemand) {
           demandResponseEntry := validHitEntry
           responseValid(0) := true.B
+          responseIsInvalidate(0) := false.B
           events.demandHit := true.B
         }.otherwise {
           events.prefetchHit := true.B
@@ -334,6 +349,7 @@ class TmaV2DescriptorService(
       when(demandWaiter) {
         demandResponseEntry := compilerEntry
         responseValid(0) := true.B
+        responseIsInvalidate(0) := false.B
         demandWaiter := false.B
       }
     }
@@ -342,8 +358,9 @@ class TmaV2DescriptorService(
 
   when(io.invalidateAll) {
     state.foreach(_ := EntryState.Invalid)
-    plru := 0.U
+    plru.foreach(_ := false.B)
     responseValid.foreach(_ := false.B)
+    responseIsInvalidate.foreach(_ := false.B)
     when(compilerOccupied && !compileKill) {
       compileKill := true.B
       events.invalidateKill := true.B
@@ -351,7 +368,8 @@ class TmaV2DescriptorService(
     when(demandWaiter) { retryDemand := true.B }
   }
 
-  when(responseValid(0) && !invalidatePending && !io.invalidateAll) {
+  when(responseValid(0) && !responseIsInvalidate(0) &&
+      !invalidatePending && !io.invalidateAll) {
     assert(state(demandResponseEntry) === EntryState.Valid,
       "a pending demand response must pin one valid compiled entry")
   }
